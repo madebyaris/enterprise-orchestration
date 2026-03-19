@@ -11,7 +11,7 @@ use domain::{
     NewExecutorProfile, NewProject, NewRun, NewWorkflowTemplate, Project, Run, RunStatus, RunStep,
     RunStepStatus, WorkflowStep, WorkflowTemplate,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
@@ -368,6 +368,104 @@ impl OrchestratorStore {
             .map_err(Into::into)
     }
 
+    pub fn get_run(&self, run_id: Uuid) -> Result<Option<Run>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, workflow_template_id, executor_profile_id, status, requested_by, created_at, updated_at
+             FROM runs
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([run_id.to_string()], map_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_run_status(&self, run_id: Uuid, status: RunStatus) -> Result<Run> {
+        let updated_at = Utc::now();
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "UPDATE runs SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                params![
+                    run_id.to_string(),
+                    status.as_str(),
+                    to_timestamp(updated_at)
+                ],
+            )?;
+        }
+
+        self.get_run(run_id)?
+            .ok_or_else(|| anyhow!("run {run_id} not found after update"))
+    }
+
+    pub fn list_run_steps(&self, run_id: Uuid) -> Result<Vec<RunStep>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, workflow_step_id, status, external_session_id, created_at, updated_at
+             FROM run_steps
+             WHERE run_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+
+        let rows = statement.query_map([run_id.to_string()], map_run_step)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_run_step(&self, run_step_id: Uuid) -> Result<Option<RunStep>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, workflow_step_id, status, external_session_id, created_at, updated_at
+             FROM run_steps
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([run_step_id.to_string()], map_run_step)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_run_step_status(
+        &self,
+        run_step_id: Uuid,
+        status: RunStepStatus,
+        external_session_id: Option<String>,
+    ) -> Result<RunStep> {
+        let updated_at = Utc::now();
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "UPDATE run_steps SET status = ?2, external_session_id = ?3, updated_at = ?4 WHERE id = ?1",
+                params![
+                    run_step_id.to_string(),
+                    status.as_str(),
+                    external_session_id.as_deref(),
+                    to_timestamp(updated_at),
+                ],
+            )?;
+        }
+
+        self.get_run_step(run_step_id)?
+            .ok_or_else(|| anyhow!("run step {run_step_id} not found after update"))
+    }
+
+    pub fn get_workflow_step(&self, workflow_step_id: Uuid) -> Result<Option<WorkflowStep>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, workflow_template_id, name, instruction, order_index, executor_kind, depends_on_step_id, timeout_seconds, retry_limit, requires_approval
+             FROM workflow_steps
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([workflow_step_id.to_string()], map_workflow_step)
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn create_approval_gate(
         &self,
         run_id: Uuid,
@@ -434,6 +532,70 @@ impl OrchestratorStore {
             .map_err(Into::into)
     }
 
+    pub fn get_approval_gate(&self, approval_id: Uuid) -> Result<Option<ApprovalGate>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, run_step_id, status, requested_by, resolved_by, notes, created_at, resolved_at
+             FROM approvals
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([approval_id.to_string()], map_approval_gate)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn find_pending_approval_for_run_step(
+        &self,
+        run_step_id: Uuid,
+    ) -> Result<Option<ApprovalGate>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, run_step_id, status, requested_by, resolved_by, notes, created_at, resolved_at
+             FROM approvals
+             WHERE run_step_id = ?1 AND status = 'pending'
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )?;
+
+        statement
+            .query_row([run_step_id.to_string()], map_approval_gate)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_approval_gate(
+        &self,
+        approval_id: Uuid,
+        status: ApprovalDecision,
+        resolved_by: Option<String>,
+        notes: Option<String>,
+    ) -> Result<ApprovalGate> {
+        let resolved_at = match status {
+            ApprovalDecision::Pending => None,
+            _ => Some(Utc::now()),
+        };
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "UPDATE approvals
+                 SET status = ?2, resolved_by = ?3, notes = ?4, resolved_at = ?5
+                 WHERE id = ?1",
+                params![
+                    approval_id.to_string(),
+                    status.as_str(),
+                    resolved_by.as_deref(),
+                    notes.as_deref(),
+                    resolved_at.map(to_timestamp),
+                ],
+            )?;
+        }
+
+        self.get_approval_gate(approval_id)?
+            .ok_or_else(|| anyhow!("approval gate {approval_id} not found after update"))
+    }
+
     pub fn record_event(&self, event: &EventEnvelope) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -477,7 +639,7 @@ impl OrchestratorStore {
             .map_err(Into::into)
     }
 
-    fn list_workflow_steps(&self, workflow_template_id: Uuid) -> Result<Vec<WorkflowStep>> {
+    pub fn list_workflow_steps(&self, workflow_template_id: Uuid) -> Result<Vec<WorkflowStep>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, workflow_template_id, name, instruction, order_index, executor_kind, depends_on_step_id, timeout_seconds, retry_limit, requires_approval
@@ -486,21 +648,7 @@ impl OrchestratorStore {
              ORDER BY order_index ASC",
         )?;
 
-        let rows = statement.query_map([workflow_template_id.to_string()], |row| {
-            Ok(WorkflowStep {
-                id: parse_uuid(row.get::<_, String>(0)?)?,
-                workflow_template_id: parse_uuid(row.get::<_, String>(1)?)?,
-                name: row.get(2)?,
-                instruction: row.get(3)?,
-                order_index: row.get(4)?,
-                executor_kind: ExecutorKind::from_str(&row.get::<_, String>(5)?)
-                    .map_err(to_sql_conversion_error)?,
-                depends_on_step_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
-                timeout_seconds: row.get(7)?,
-                retry_limit: row.get(8)?,
-                requires_approval: row.get::<_, i64>(9)? == 1,
-            })
-        })?;
+        let rows = statement.query_map([workflow_template_id.to_string()], map_workflow_step)?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -515,6 +663,63 @@ impl OrchestratorStore {
 
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value).map_err(to_sql_conversion_error)
+}
+
+fn map_run(row: &Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        project_id: parse_uuid(row.get::<_, String>(1)?)?,
+        workflow_template_id: parse_uuid(row.get::<_, String>(2)?)?,
+        executor_profile_id: parse_optional_uuid(row.get::<_, Option<String>>(3)?)?,
+        status: RunStatus::from_str(&row.get::<_, String>(4)?).map_err(to_sql_conversion_error)?,
+        requested_by: row.get(5)?,
+        created_at: parse_datetime(&row.get::<_, String>(6)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(7)?)?,
+    })
+}
+
+fn map_run_step(row: &Row<'_>) -> rusqlite::Result<RunStep> {
+    Ok(RunStep {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        run_id: parse_uuid(row.get::<_, String>(1)?)?,
+        workflow_step_id: parse_uuid(row.get::<_, String>(2)?)?,
+        status: RunStepStatus::from_str(&row.get::<_, String>(3)?)
+            .map_err(to_sql_conversion_error)?,
+        external_session_id: row.get(4)?,
+        created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(6)?)?,
+    })
+}
+
+fn map_workflow_step(row: &Row<'_>) -> rusqlite::Result<WorkflowStep> {
+    Ok(WorkflowStep {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        workflow_template_id: parse_uuid(row.get::<_, String>(1)?)?,
+        name: row.get(2)?,
+        instruction: row.get(3)?,
+        order_index: row.get(4)?,
+        executor_kind: ExecutorKind::from_str(&row.get::<_, String>(5)?)
+            .map_err(to_sql_conversion_error)?,
+        depends_on_step_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
+        timeout_seconds: row.get(7)?,
+        retry_limit: row.get(8)?,
+        requires_approval: row.get::<_, i64>(9)? == 1,
+    })
+}
+
+fn map_approval_gate(row: &Row<'_>) -> rusqlite::Result<ApprovalGate> {
+    Ok(ApprovalGate {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        run_id: parse_uuid(row.get::<_, String>(1)?)?,
+        run_step_id: parse_optional_uuid(row.get::<_, Option<String>>(2)?)?,
+        status: ApprovalDecision::from_str(&row.get::<_, String>(3)?)
+            .map_err(to_sql_conversion_error)?,
+        requested_by: row.get(4)?,
+        resolved_by: row.get(5)?,
+        notes: row.get(6)?,
+        created_at: parse_datetime(&row.get::<_, String>(7)?)?,
+        resolved_at: parse_optional_datetime(row.get::<_, Option<String>>(8)?)?,
+    })
 }
 
 fn parse_optional_uuid(value: Option<String>) -> rusqlite::Result<Option<Uuid>> {

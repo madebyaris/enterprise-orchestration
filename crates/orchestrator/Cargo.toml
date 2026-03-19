@@ -1,6 +1,13 @@
 [package]
 name = "orchestrator"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+domain = { path = "../domain" }
+observability = { path = "../observability" }
+persistence = { path = "../persistence" }
+serde_json.workspace = true
+uuid.workspace = true
