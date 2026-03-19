@@ -1,6 +1,16 @@
 [package]
 name = "desktop-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+axum.workspace = true
+control-server = { path = "../control-server" }
+observability = { path = "../observability" }
+persistence = { path = "../persistence" }
+security = { path = "../security" }
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
