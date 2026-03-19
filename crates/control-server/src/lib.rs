@@ -1,19 +1,20 @@
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, Uri},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
 };
 use domain::{
     ApprovalGate, EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile, NewProject,
-    NewRun, NewWorkflowTemplate, Project, Run, WorkflowTemplate,
+    NewRun, NewWorkflowTemplate, PairingSession, Project, Run, WorkflowTemplate,
 };
 use futures_util::StreamExt;
 use observability::EventBus;
@@ -22,12 +23,17 @@ use persistence::OrchestratorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: OrchestratorStore,
     pub events: EventBus,
+    pub frontend_dist: Option<PathBuf>,
 }
 
 impl AppState {
@@ -35,6 +41,7 @@ impl AppState {
         Ok(Self {
             store: OrchestratorStore::open_in_memory()?,
             events: EventBus::default(),
+            frontend_dist: None,
         })
     }
 }
@@ -54,6 +61,18 @@ struct ErrorResponse {
 struct ApprovalResolutionRequest {
     resolved_by: Option<String>,
     notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairingSessionCreateRequest {
+    label: Option<String>,
+    expires_in_minutes: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PairingSessionResponse {
+    session: PairingSession,
+    remote_url: String,
 }
 
 #[derive(Debug)]
@@ -78,7 +97,8 @@ impl IntoResponse for ApiError {
 }
 
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let frontend_dist = state.frontend_dist.clone();
+    let api_router = Router::new()
         .route("/health", get(health))
         .route("/api/projects", get(list_projects).post(create_project))
         .route("/api/executors", get(list_executors).post(create_executor))
@@ -92,12 +112,33 @@ pub fn app(state: AppState) -> Router {
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/{approval_id}/approve", post(approve_gate))
         .route("/api/approvals/{approval_id}/reject", post(reject_gate))
+        .route(
+            "/api/pairing-sessions",
+            get(list_pairing_sessions).post(create_pairing_session),
+        )
+        .route(
+            "/api/pairing-sessions/{pairing_id}/revoke",
+            post(revoke_pairing_session),
+        )
         .route("/api/events", get(list_events))
         .route("/api/events/stream", get(stream_events))
         .route("/api/events/test", post(publish_test_event))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_remote_api,
+        ))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(CorsLayer::permissive());
+
+    if let Some(frontend_dist) = frontend_dist {
+        api_router.fallback_service(
+            ServeDir::new(frontend_dist.clone())
+                .fallback(ServeFile::new(frontend_dist.join("index.html"))),
+        )
+    } else {
+        api_router
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -243,6 +284,70 @@ async fn list_events(State(state): State<AppState>) -> Result<Json<Vec<EventEnve
     Ok(Json(state.store.list_events()?))
 }
 
+async fn list_pairing_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PairingSession>>, ApiError> {
+    Ok(Json(state.store.list_pairing_sessions()?))
+}
+
+async fn create_pairing_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PairingSessionCreateRequest>,
+) -> Result<(StatusCode, Json<PairingSessionResponse>), ApiError> {
+    let expires_at = input
+        .expires_in_minutes
+        .filter(|minutes| *minutes > 0)
+        .map(|minutes| chrono::Utc::now() + chrono::Duration::minutes(minutes));
+    let session = state
+        .store
+        .create_pairing_session(input.label, expires_at)?;
+    let remote_url = build_remote_url(&headers, &session.token);
+
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::System,
+            "pairing.created",
+            "Created a remote browser pairing session",
+            json!({
+                "pairing_id": session.id,
+                "remote_url": remote_url,
+            }),
+        ),
+    )?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PairingSessionResponse {
+            session,
+            remote_url,
+        }),
+    ))
+}
+
+async fn revoke_pairing_session(
+    State(state): State<AppState>,
+    Path(pairing_id): Path<String>,
+) -> Result<Json<PairingSession>, ApiError> {
+    let pairing_id = uuid::Uuid::parse_str(&pairing_id).map_err(anyhow::Error::from)?;
+    let session = state.store.revoke_pairing_session(pairing_id)?;
+
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::System,
+            "pairing.revoked",
+            "Revoked a remote browser pairing session",
+            json!({
+                "pairing_id": session.id,
+            }),
+        ),
+    )?;
+
+    Ok(Json(session))
+}
+
 async fn stream_events(
     State(state): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
@@ -277,6 +382,80 @@ fn emit_event(state: &AppState, event: EventEnvelope) -> Result<(), ApiError> {
     state.store.record_event(&event)?;
     state.events.publish(event);
     Ok(())
+}
+
+async fn authorize_remote_api(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if is_local_host_request(&headers) {
+        return Ok(next.run(request).await);
+    }
+
+    let token = headers
+        .get("x-orch-pairing-token")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+        .or_else(|| token_from_query(&uri));
+
+    match token {
+        Some(token)
+            if state
+                .store
+                .find_active_pairing_session_by_token(&token)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .is_some() =>
+        {
+            Ok(next.run(request).await)
+        }
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+fn is_local_host_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .map(|host| {
+            host.starts_with("127.0.0.1")
+                || host.starts_with("localhost")
+                || host.starts_with("[::1]")
+        })
+        .unwrap_or(true)
+}
+
+fn token_from_query(uri: &Uri) -> Option<String> {
+    uri.query().and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let value = parts.next()?;
+            if key == "token" {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn build_remote_url(headers: &HeaderMap, token: &str) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("127.0.0.1:42420");
+    let port = host.split(':').nth(1).unwrap_or("42420");
+    let remote_host = detect_lan_ip().unwrap_or_else(|| "127.0.0.1".into());
+    format!("http://{remote_host}:{port}/?token={token}")
+}
+
+fn detect_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 #[cfg(test)]

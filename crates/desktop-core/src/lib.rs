@@ -18,6 +18,7 @@ pub struct DesktopConfig {
     pub control_port: u16,
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
+    pub frontend_dist: PathBuf,
     pub secret_service_name: String,
 }
 
@@ -38,6 +39,9 @@ impl DesktopConfig {
                 .unwrap_or(42420),
             data_dir,
             db_path,
+            frontend_dist: std::env::var("ORCH_FRONTEND_DIST")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("apps/control-ui/dist")),
             secret_service_name: "enterprise-orchestration".into(),
         }
     }
@@ -120,6 +124,7 @@ impl DesktopRuntime {
         let router = app(AppState {
             store: self.store.clone(),
             events: self.events.clone(),
+            frontend_dist: Some(self.config.frontend_dist.clone()),
         });
 
         let task = tokio::spawn(async move {
@@ -179,6 +184,7 @@ impl DesktopRuntime {
 mod tests {
     use std::{
         env,
+        path::PathBuf,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -201,6 +207,7 @@ mod tests {
             control_port: 0,
             db_path: data_dir.join("orchestrator.db"),
             data_dir,
+            frontend_dist: PathBuf::from("/workspace/apps/control-ui/dist"),
             secret_service_name: "enterprise-orchestration-tests".into(),
         }
     }

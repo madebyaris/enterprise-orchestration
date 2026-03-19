@@ -8,8 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
     ApprovalDecision, ApprovalGate, EventEnvelope, EventScope, ExecutorKind, ExecutorProfile,
-    NewExecutorProfile, NewProject, NewRun, NewWorkflowTemplate, Project, Run, RunStatus, RunStep,
-    RunStepStatus, WorkflowStep, WorkflowTemplate,
+    NewExecutorProfile, NewProject, NewRun, NewWorkflowTemplate, PairingSession, Project, Run,
+    RunStatus, RunStep, RunStepStatus, WorkflowStep, WorkflowTemplate,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
@@ -596,6 +596,95 @@ impl OrchestratorStore {
             .ok_or_else(|| anyhow!("approval gate {approval_id} not found after update"))
     }
 
+    pub fn create_pairing_session(
+        &self,
+        label: Option<String>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<PairingSession> {
+        let session = PairingSession {
+            id: Uuid::new_v4(),
+            token: Uuid::new_v4().simple().to_string(),
+            label,
+            is_revoked: false,
+            created_at: Utc::now(),
+            expires_at,
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO pairing_sessions
+            (id, token, label, is_revoked, created_at, expires_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session.id.to_string(),
+                session.token,
+                session.label.as_deref(),
+                session.is_revoked as i64,
+                to_timestamp(session.created_at),
+                session.expires_at.map(to_timestamp),
+            ],
+        )?;
+
+        Ok(session)
+    }
+
+    pub fn list_pairing_sessions(&self) -> Result<Vec<PairingSession>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, token, label, is_revoked, created_at, expires_at
+             FROM pairing_sessions
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = statement.query_map([], map_pairing_session)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn find_active_pairing_session_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<PairingSession>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, token, label, is_revoked, created_at, expires_at
+             FROM pairing_sessions
+             WHERE token = ?1 AND is_revoked = 0
+             LIMIT 1",
+        )?;
+
+        let session = statement
+            .query_row([token], map_pairing_session)
+            .optional()?;
+
+        Ok(session.and_then(|value| {
+            if value
+                .expires_at
+                .map(|expires_at| expires_at < Utc::now())
+                .unwrap_or(false)
+            {
+                None
+            } else {
+                Some(value)
+            }
+        }))
+    }
+
+    pub fn revoke_pairing_session(&self, pairing_id: Uuid) -> Result<PairingSession> {
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "UPDATE pairing_sessions SET is_revoked = 1 WHERE id = ?1",
+                params![pairing_id.to_string()],
+            )?;
+        }
+
+        self.list_pairing_sessions()?
+            .into_iter()
+            .find(|session| session.id == pairing_id)
+            .ok_or_else(|| anyhow!("pairing session {pairing_id} not found after revoke"))
+    }
+
     pub fn record_event(&self, event: &EventEnvelope) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -722,6 +811,17 @@ fn map_approval_gate(row: &Row<'_>) -> rusqlite::Result<ApprovalGate> {
     })
 }
 
+fn map_pairing_session(row: &Row<'_>) -> rusqlite::Result<PairingSession> {
+    Ok(PairingSession {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        token: row.get(1)?,
+        label: row.get(2)?,
+        is_revoked: row.get::<_, i64>(3)? == 1,
+        created_at: parse_datetime(&row.get::<_, String>(4)?)?,
+        expires_at: parse_optional_datetime(row.get::<_, Option<String>>(5)?)?,
+    })
+}
+
 fn parse_optional_uuid(value: Option<String>) -> rusqlite::Result<Option<Uuid>> {
     value.map(parse_uuid).transpose()
 }
@@ -840,5 +940,27 @@ mod tests {
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].id, gate.id);
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn creates_and_revokes_pairing_sessions() {
+        let store = OrchestratorStore::open_in_memory().expect("store");
+
+        let session = store
+            .create_pairing_session(Some("Phone".into()), None)
+            .expect("pairing session");
+        assert!(store
+            .find_active_pairing_session_by_token(&session.token)
+            .expect("lookup")
+            .is_some());
+
+        let revoked = store
+            .revoke_pairing_session(session.id)
+            .expect("revoke pairing");
+        assert!(revoked.is_revoked);
+        assert!(store
+            .find_active_pairing_session_by_token(&session.token)
+            .expect("lookup")
+            .is_none());
     }
 }
