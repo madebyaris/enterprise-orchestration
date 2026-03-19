@@ -184,6 +184,14 @@ dependencies = [
 [[package]]
 name = "executors"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "domain",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "fallible-iterator"
