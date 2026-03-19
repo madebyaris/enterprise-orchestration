@@ -194,6 +194,10 @@
   color: var(--text-h);
 }
 
+.panel-header.compact {
+  margin-bottom: -4px;
+}
+
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -345,6 +349,44 @@ textarea:focus,
   gap: 6px;
 }
 
+.pairing-card {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+  justify-items: center;
+  background: rgba(15, 23, 42, 0.42);
+}
+
+.pairing-copy {
+  width: 100%;
+  display: grid;
+  gap: 6px;
+}
+
+.pairing-copy code {
+  display: block;
+  width: 100%;
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(2, 6, 23, 0.75);
+  border: 1px solid var(--border);
+  color: var(--text-h);
+  font-family: var(--mono);
+}
+
+.qr-code {
+  width: 220px;
+  height: 220px;
+  max-width: 100%;
+  border-radius: 16px;
+  padding: 12px;
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid var(--border);
+}
+
 .step-card,
 .approval-card {
   padding: 16px;
@@ -454,6 +496,11 @@ textarea:focus,
   color: var(--text-dim);
   font-size: 13px;
   white-space: nowrap;
+}
+
+.artifact-section {
+  display: grid;
+  gap: 12px;
 }
 
 @media (max-width: 1200px) {

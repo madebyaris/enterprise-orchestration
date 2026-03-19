@@ -177,6 +177,19 @@ impl RunOrchestrator {
 
         if let Some(status) = terminal_run_status(&snapshot.run_steps) {
             self.store.update_run_status(run_id, status.clone())?;
+            if self.store.list_artifacts_for_run(run_id)?.is_empty() {
+                self.store.create_artifact(
+                    run_id,
+                    None,
+                    "Run summary",
+                    "summary",
+                    Some("application/json".into()),
+                    json!({
+                        "run_id": run_id,
+                        "status": status.as_str(),
+                    }),
+                )?;
+            }
             self.emit(EventEnvelope::new(
                 EventScope::Run,
                 format!("run.{}", status.as_str()),

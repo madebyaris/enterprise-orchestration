@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use desktop_core::{DesktopConfig, DesktopRuntime, DesktopStatus};
+use tauri::path::BaseDirectory;
 use tauri::{Manager, State};
 
 struct DesktopState {
@@ -48,15 +49,7 @@ fn get_secret(state: State<'_, DesktopState>, key: String) -> Result<Option<Stri
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let runtime = Arc::new(
-        DesktopRuntime::with_keyring_secrets(DesktopConfig::from_env())
-            .expect("failed to initialize desktop runtime"),
-    );
-
     tauri::Builder::default()
-        .manage(DesktopState {
-            runtime: runtime.clone(),
-        })
         .invoke_handler(tauri::generate_handler![
             desktop_status,
             start_control_server,
@@ -65,7 +58,21 @@ pub fn run() {
             get_secret
         ])
         .setup(move |app| {
-            let runtime = app.state::<DesktopState>().runtime.clone();
+            let mut config = DesktopConfig::from_env();
+            if let Ok(resource_path) = app.path().resolve("remote-ui", BaseDirectory::Resource) {
+                if resource_path.exists() {
+                    config.frontend_dist = resource_path;
+                }
+            }
+
+            let runtime = Arc::new(
+                DesktopRuntime::with_keyring_secrets(config)
+                    .expect("failed to initialize desktop runtime"),
+            );
+            app.manage(DesktopState {
+                runtime: runtime.clone(),
+            });
+
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = runtime.start_control_server().await {
                     tracing::error!("failed to start control server: {error}");

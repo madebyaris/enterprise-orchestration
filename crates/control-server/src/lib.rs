@@ -7,14 +7,14 @@ use axum::{
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
+        Html, IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
 };
 use domain::{
-    ApprovalGate, EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile, NewProject,
-    NewRun, NewWorkflowTemplate, PairingSession, Project, Run, WorkflowTemplate,
+    ApprovalGate, Artifact, EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile,
+    NewProject, NewRun, NewWorkflowTemplate, PairingSession, Project, Run, WorkflowTemplate,
 };
 use futures_util::StreamExt;
 use observability::EventBus;
@@ -23,11 +23,7 @@ use persistence::OrchestratorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::{
-    cors::CorsLayer,
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -69,7 +65,7 @@ struct PairingSessionCreateRequest {
     expires_in_minutes: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PairingSessionResponse {
     session: PairingSession,
     remote_url: String,
@@ -105,6 +101,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/workflows", get(list_workflows).post(create_workflow))
         .route("/api/runs", get(list_runs).post(create_run))
         .route("/api/runs/{run_id}", get(get_run))
+        .route("/api/runs/{run_id}/artifacts", get(list_run_artifacts))
         .route(
             "/api/runs/{run_id}/steps/{run_step_id}/complete",
             post(complete_run_step),
@@ -127,18 +124,19 @@ pub fn app(state: AppState) -> Router {
             state.clone(),
             authorize_remote_api,
         ))
-        .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
-    if let Some(frontend_dist) = frontend_dist {
-        api_router.fallback_service(
-            ServeDir::new(frontend_dist.clone())
-                .fallback(ServeFile::new(frontend_dist.join("index.html"))),
-        )
+    let router = if let Some(frontend_dist) = frontend_dist {
+        api_router
+            .route("/", get(serve_frontend_index))
+            .route("/index.html", get(serve_frontend_index))
+            .nest_service("/assets", ServeDir::new(frontend_dist.join("assets")))
     } else {
         api_router
-    }
+    };
+
+    router.with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -146,6 +144,16 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+async fn serve_frontend_index(State(state): State<AppState>) -> Result<Html<String>, ApiError> {
+    let frontend_dist = state
+        .frontend_dist
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("frontend dist path is not configured"))?;
+    let index_path = frontend_dist.join("index.html");
+    let html = std::fs::read_to_string(&index_path).map_err(anyhow::Error::from)?;
+    Ok(Html(html))
 }
 
 async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
@@ -235,6 +243,14 @@ async fn get_run(
     let run_id = uuid::Uuid::parse_str(&run_id).map_err(anyhow::Error::from)?;
     let orchestrator = RunOrchestrator::new(state.store.clone(), state.events.clone());
     Ok(Json(orchestrator.snapshot(run_id)?))
+}
+
+async fn list_run_artifacts(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Vec<Artifact>>, ApiError> {
+    let run_id = uuid::Uuid::parse_str(&run_id).map_err(anyhow::Error::from)?;
+    Ok(Json(state.store.list_artifacts_for_run(run_id)?))
 }
 
 async fn complete_run_step(
@@ -460,12 +476,16 @@ fn detect_lan_ip() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
-    use domain::{ApprovalGate, EventEnvelope, ExecutorKind, RunStatus};
+    use domain::{ApprovalGate, Artifact, EventEnvelope, ExecutorKind, RunStatus};
+    use observability::EventBus;
     use orchestrator::RunStateSnapshot;
+    use persistence::OrchestratorStore;
     use tower::util::ServiceExt;
 
     use super::{app, AppState};
@@ -713,6 +733,7 @@ mod tests {
         assert_eq!(approved.run.status, RunStatus::Running);
 
         let complete_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -732,6 +753,24 @@ mod tests {
         let completed: RunStateSnapshot =
             serde_json::from_slice(&complete_body).expect("completed snapshot");
         assert_eq!(completed.run.status, RunStatus::Completed);
+
+        let artifact_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/runs/{}/artifacts", waiting.run.id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(artifact_response.status(), StatusCode::OK);
+        let artifact_body = to_bytes(artifact_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let artifacts: Vec<Artifact> = serde_json::from_slice(&artifact_body).expect("artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "summary");
     }
 
     #[tokio::test]
@@ -784,5 +823,93 @@ mod tests {
             .expect("body");
         let approvals: Vec<ApprovalGate> = serde_json::from_slice(&body).expect("approvals");
         assert!(approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_api_requests_require_pairing_token() {
+        let state = AppState::in_memory().expect("state");
+        let app = app(state.clone());
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/projects")
+                    .header("host", "192.168.1.10:42420")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let pairing_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pairing-sessions")
+                    .header("host", "127.0.0.1:42420")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "label": "Phone",
+                            "expires_in_minutes": 30
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(pairing_response.status(), StatusCode::CREATED);
+        let pairing_body = to_bytes(pairing_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let pairing: super::PairingSessionResponse =
+            serde_json::from_slice(&pairing_body).expect("pairing");
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/projects")
+                    .header("host", "192.168.1.10:42420")
+                    .header("x-orch-pairing-token", pairing.session.token)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serves_frontend_index_when_dist_is_configured() {
+        let state = AppState {
+            store: OrchestratorStore::open_in_memory().expect("store"),
+            events: EventBus::default(),
+            frontend_dist: Some(PathBuf::from("/workspace/apps/control-ui/dist")),
+        };
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8(body.to_vec()).expect("html");
+        assert!(html.contains("<div id=\"root\"></div>"));
     }
 }

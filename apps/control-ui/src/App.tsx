@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import QRCode from 'qrcode'
 import './App.css'
 
 type ExecutorKind =
@@ -78,6 +79,30 @@ type ApprovalGate = {
   resolved_by?: string | null
 }
 
+type PairingSession = {
+  id: string
+  token: string
+  label?: string | null
+  is_revoked: boolean
+  created_at: string
+  expires_at?: string | null
+}
+
+type PairingSessionResponse = {
+  session: PairingSession
+  remote_url: string
+}
+
+type Artifact = {
+  id: string
+  run_id: string
+  run_step_id?: string | null
+  name: string
+  kind: string
+  content_type?: string | null
+  metadata_json: Record<string, unknown>
+}
+
 type EventEnvelope = {
   id: string
   event_type: string
@@ -99,6 +124,7 @@ type DashboardData = {
   workflows: WorkflowTemplate[]
   runs: Run[]
   approvals: ApprovalGate[]
+  pairings: PairingSession[]
   events: EventEnvelope[]
 }
 
@@ -127,9 +153,15 @@ function resolveApiBase() {
 const API_BASE = resolveApiBase()
 
 async function requestJson<T>(path: string, init?: RequestInit) {
+  const pairingToken =
+    typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('token')
+      : null
+
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
       'Content-Type': 'application/json',
+      ...(pairingToken ? { 'x-orch-pairing-token': pairingToken } : {}),
       ...(init?.headers ?? {}),
     },
     ...init,
@@ -155,15 +187,19 @@ function App() {
     workflows: [],
     runs: [],
     approvals: [],
+    pairings: [],
     events: [],
   })
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const [selectedRun, setSelectedRun] = useState<RunSnapshot | null>(null)
+  const [selectedArtifacts, setSelectedArtifacts] = useState<Artifact[]>([])
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null)
+  const [activePairingUrl, setActivePairingUrl] = useState<string | null>(null)
+  const [pairingQrDataUrl, setPairingQrDataUrl] = useState<string | null>(null)
 
   const [projectForm, setProjectForm] = useState({
     name: '',
@@ -191,18 +227,24 @@ function App() {
     executorProfileId: '',
     requestedBy: 'operator',
   })
+  const [pairingForm, setPairingForm] = useState({
+    label: 'Phone control',
+    expiresInMinutes: 60,
+  })
 
   const refreshDashboard = useCallback(async () => {
-    const [projects, executors, workflows, runs, approvals, events] = await Promise.all([
+    const [projects, executors, workflows, runs, approvals, pairings, events] =
+      await Promise.all([
       requestJson<Project[]>('/api/projects'),
       requestJson<ExecutorProfile[]>('/api/executors'),
       requestJson<WorkflowTemplate[]>('/api/workflows'),
       requestJson<Run[]>('/api/runs'),
       requestJson<ApprovalGate[]>('/api/approvals'),
+      requestJson<PairingSession[]>('/api/pairing-sessions'),
       requestJson<EventEnvelope[]>('/api/events'),
     ])
 
-    setDashboard({ projects, executors, workflows, runs, approvals, events })
+    setDashboard({ projects, executors, workflows, runs, approvals, pairings, events })
     setLastRefreshedAt(new Date())
 
     if (!selectedRunId && runs[0]) {
@@ -213,12 +255,17 @@ function App() {
   const refreshSelectedRun = useCallback(async () => {
     if (!selectedRunId) {
       setSelectedRun(null)
+      setSelectedArtifacts([])
       return
     }
 
     try {
-      const snapshot = await requestJson<RunSnapshot>(`/api/runs/${selectedRunId}`)
+      const [snapshot, artifacts] = await Promise.all([
+        requestJson<RunSnapshot>(`/api/runs/${selectedRunId}`),
+        requestJson<Artifact[]>(`/api/runs/${selectedRunId}/artifacts`),
+      ])
       setSelectedRun(snapshot)
+      setSelectedArtifacts(artifacts)
     } catch (runError) {
       console.warn(runError)
     }
@@ -257,6 +304,36 @@ function App() {
   useEffect(() => {
     void refreshSelectedRun()
   }, [refreshSelectedRun])
+
+  useEffect(() => {
+    if (!activePairingUrl) {
+      setPairingQrDataUrl(null)
+      return
+    }
+
+    let cancelled = false
+    QRCode.toDataURL(activePairingUrl, {
+      color: {
+        dark: '#f8fafc',
+        light: '#0000',
+      },
+      margin: 1,
+      width: 220,
+    })
+      .then((value: string) => {
+        if (!cancelled) {
+          setPairingQrDataUrl(value)
+        }
+      })
+      .catch((error: unknown) => {
+        console.warn(error)
+        setPairingQrDataUrl(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activePairingUrl])
 
   useEffect(() => {
     if (!workflowForm.projectId && dashboard.projects[0]) {
@@ -382,8 +459,35 @@ function App() {
       })
       setSelectedRunId(snapshot.run.id)
       setSelectedRun(snapshot)
+      setSelectedArtifacts([])
       setView('runs')
       setSuccessMessage(`Started run ${snapshot.run.id.slice(0, 8)}`)
+    })
+
+  const createPairingSession = async () =>
+    handleAction('create-pairing', async () => {
+      const response = await requestJson<PairingSessionResponse>('/api/pairing-sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          label: pairingForm.label || null,
+          expires_in_minutes: pairingForm.expiresInMinutes,
+        }),
+      })
+      setActivePairingUrl(response.remote_url)
+      setSuccessMessage('Created a phone pairing link')
+    })
+
+  const revokePairingSession = async (pairingId: string) =>
+    handleAction(`revoke-pairing-${pairingId}`, async () => {
+      await requestJson<PairingSession>(`/api/pairing-sessions/${pairingId}/revoke`, {
+        method: 'POST',
+      })
+
+      if (dashboard.pairings.find((session) => session.id === pairingId)?.is_revoked === false) {
+        setActivePairingUrl(null)
+        setPairingQrDataUrl(null)
+      }
+      setSuccessMessage('Revoked remote browser access')
     })
 
   const completeStep = async (runStepId: string) =>
@@ -970,12 +1074,128 @@ function App() {
                       )
                     })}
                   </div>
+
+                  <div className="artifact-section">
+                    <div className="panel-header compact">
+                      <div>
+                        <p className="eyebrow">Artifacts</p>
+                        <h3>Run outputs</h3>
+                      </div>
+                    </div>
+                    <div className="card-grid">
+                      {selectedArtifacts.map((artifact) => (
+                        <article key={artifact.id} className="mini-card">
+                          <strong>{artifact.name}</strong>
+                          <span className="status-chip neutral">{artifact.kind}</span>
+                          <p>{JSON.stringify(artifact.metadata_json)}</p>
+                        </article>
+                      ))}
+                      {!selectedArtifacts.length && (
+                        <div className="empty-state">
+                          Artifacts will appear here after the run completes.
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </>
               ) : (
                 <div className="empty-state">
                   Choose a run to inspect step status, approvals, and operator actions.
                 </div>
               )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <p className="eyebrow">Phone control</p>
+                  <h3>Pair a remote browser session</h3>
+                </div>
+                <span className="status-chip warning">
+                  {dashboard.pairings.filter((session) => !session.is_revoked).length} active
+                </span>
+              </div>
+
+              <div className="form-grid">
+                <input
+                  value={pairingForm.label}
+                  onChange={(event) =>
+                    setPairingForm((current) => ({ ...current, label: event.target.value }))
+                  }
+                  placeholder="Pairing label"
+                />
+                <input
+                  type="number"
+                  min={5}
+                  value={pairingForm.expiresInMinutes}
+                  onChange={(event) =>
+                    setPairingForm((current) => ({
+                      ...current,
+                      expiresInMinutes: Number(event.target.value) || 60,
+                    }))
+                  }
+                  placeholder="Expires in minutes"
+                />
+              </div>
+
+              <button
+                className="primary-button"
+                disabled={submitting !== null}
+                onClick={() => void createPairingSession()}
+              >
+                {submitting === 'create-pairing' ? 'Generating…' : 'Generate QR pairing'}
+              </button>
+
+              {activePairingUrl ? (
+                <div className="pairing-card">
+                  {pairingQrDataUrl ? (
+                    <img
+                      src={pairingQrDataUrl}
+                      alt="QR code for remote phone control"
+                      className="qr-code"
+                    />
+                  ) : null}
+                  <div className="pairing-copy">
+                    <span className="meta-label">Remote URL</span>
+                    <code>{activePairingUrl}</code>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="table-list">
+                {dashboard.pairings.map((session) => (
+                  <article key={session.id} className="list-row stacked">
+                    <div>
+                      <strong>{session.label || 'Remote session'}</strong>
+                      <p>{session.token}</p>
+                    </div>
+                    <div className="row-tags">
+                      <span className={`status-chip ${session.is_revoked ? 'cancelled' : 'healthy'}`}>
+                        {session.is_revoked ? 'revoked' : 'active'}
+                      </span>
+                      <span className="status-chip neutral">
+                        {session.expires_at
+                          ? `expires ${new Date(session.expires_at).toLocaleTimeString()}`
+                          : 'no expiry'}
+                      </span>
+                    </div>
+                    {!session.is_revoked ? (
+                      <button
+                        className="ghost-button"
+                        disabled={submitting !== null}
+                        onClick={() => void revokePairingSession(session.id)}
+                      >
+                        {submitting === `revoke-pairing-${session.id}` ? 'Revoking…' : 'Revoke'}
+                      </button>
+                    ) : null}
+                  </article>
+                ))}
+                {!dashboard.pairings.length && (
+                  <div className="empty-state">
+                    No remote pairings yet. Generate a QR code to open the dashboard from your phone.
+                  </div>
+                )}
+              </div>
             </section>
 
             <section className="panel">

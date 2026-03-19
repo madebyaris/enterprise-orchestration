@@ -7,9 +7,9 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    ApprovalDecision, ApprovalGate, EventEnvelope, EventScope, ExecutorKind, ExecutorProfile,
-    NewExecutorProfile, NewProject, NewRun, NewWorkflowTemplate, PairingSession, Project, Run,
-    RunStatus, RunStep, RunStepStatus, WorkflowStep, WorkflowTemplate,
+    ApprovalDecision, ApprovalGate, Artifact, EventEnvelope, EventScope, ExecutorKind,
+    ExecutorProfile, NewExecutorProfile, NewProject, NewRun, NewWorkflowTemplate, PairingSession,
+    Project, Run, RunStatus, RunStep, RunStepStatus, WorkflowStep, WorkflowTemplate,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
@@ -596,6 +596,62 @@ impl OrchestratorStore {
             .ok_or_else(|| anyhow!("approval gate {approval_id} not found after update"))
     }
 
+    pub fn create_artifact(
+        &self,
+        run_id: Uuid,
+        run_step_id: Option<Uuid>,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        content_type: Option<String>,
+        metadata_json: serde_json::Value,
+    ) -> Result<Artifact> {
+        let artifact = Artifact {
+            id: Uuid::new_v4(),
+            run_id,
+            run_step_id,
+            name: name.into(),
+            kind: kind.into(),
+            path: None,
+            content_type,
+            metadata_json,
+            created_at: Utc::now(),
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO artifacts
+            (id, run_id, run_step_id, name, kind, path, content_type, metadata_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                artifact.id.to_string(),
+                artifact.run_id.to_string(),
+                artifact.run_step_id.map(|value| value.to_string()),
+                &artifact.name,
+                &artifact.kind,
+                artifact.path.as_deref(),
+                artifact.content_type.as_deref(),
+                serde_json::to_string(&artifact.metadata_json)?,
+                to_timestamp(artifact.created_at),
+            ],
+        )?;
+
+        Ok(artifact)
+    }
+
+    pub fn list_artifacts_for_run(&self, run_id: Uuid) -> Result<Vec<Artifact>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, run_step_id, name, kind, path, content_type, metadata_json, created_at
+             FROM artifacts
+             WHERE run_id = ?1
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = statement.query_map([run_id.to_string()], map_artifact)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn create_pairing_session(
         &self,
         label: Option<String>,
@@ -822,6 +878,21 @@ fn map_pairing_session(row: &Row<'_>) -> rusqlite::Result<PairingSession> {
     })
 }
 
+fn map_artifact(row: &Row<'_>) -> rusqlite::Result<Artifact> {
+    let metadata_json: String = row.get(7)?;
+    Ok(Artifact {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        run_id: parse_uuid(row.get::<_, String>(1)?)?,
+        run_step_id: parse_optional_uuid(row.get::<_, Option<String>>(2)?)?,
+        name: row.get(3)?,
+        kind: row.get(4)?,
+        path: row.get(5)?,
+        content_type: row.get(6)?,
+        metadata_json: serde_json::from_str(&metadata_json).map_err(to_sql_conversion_error)?,
+        created_at: parse_datetime(&row.get::<_, String>(8)?)?,
+    })
+}
+
 fn parse_optional_uuid(value: Option<String>) -> rusqlite::Result<Option<Uuid>> {
     value.map(parse_uuid).transpose()
 }
@@ -962,5 +1033,60 @@ mod tests {
             .find_active_pairing_session_by_token(&session.token)
             .expect("lookup")
             .is_none());
+    }
+
+    #[test]
+    fn persists_artifacts_for_runs() {
+        let store = OrchestratorStore::open_in_memory().expect("store");
+
+        let project = store
+            .create_project(domain::NewProject {
+                name: "Artifacts".into(),
+                description: None,
+                workspace_path: "/tmp/artifacts".into(),
+                repository_url: None,
+                default_executor_profile_id: None,
+            })
+            .expect("project");
+        let workflow = store
+            .create_workflow(domain::NewWorkflowTemplate {
+                project_id: Some(project.id),
+                name: "Artifacts flow".into(),
+                description: None,
+                steps: vec![domain::NewWorkflowStep {
+                    name: "Step".into(),
+                    instruction: "Do the work".into(),
+                    order_index: 0,
+                    executor_kind: ExecutorKind::Shell,
+                    depends_on_step_id: None,
+                    timeout_seconds: None,
+                    retry_limit: 0,
+                    requires_approval: false,
+                }],
+            })
+            .expect("workflow");
+        let run = store
+            .create_run(domain::NewRun {
+                project_id: project.id,
+                workflow_template_id: workflow.id,
+                executor_profile_id: None,
+                requested_by: None,
+            })
+            .expect("run");
+
+        store
+            .create_artifact(
+                run.id,
+                None,
+                "Run summary",
+                "summary",
+                Some("application/json".into()),
+                serde_json::json!({"status": "completed"}),
+            )
+            .expect("artifact");
+
+        let artifacts = store.list_artifacts_for_run(run.id).expect("artifacts");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].kind, "summary");
     }
 }

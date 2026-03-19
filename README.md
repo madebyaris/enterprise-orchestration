@@ -73,7 +73,7 @@ crates/
 
 ### Prerequisites
 
-- Rust 1.83+
+- Rust 1.88+
 - Node.js 22+
 - pnpm 10+
 
@@ -93,6 +93,12 @@ pnpm build
 
 ```bash
 cargo test
+```
+
+### Build the desktop shell
+
+```bash
+pnpm --filter desktop build
 ```
 
 ## Environment
@@ -124,3 +130,10 @@ Planned secondary adapters:
 ## License
 
 Apache-2.0
+
+## Additional docs
+
+- `docs/architecture.md`
+- `docs/executor-adapters.md`
+- `docs/remote-control.md`
+- `docs/packaging.md`

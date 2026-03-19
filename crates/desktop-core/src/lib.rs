@@ -39,9 +39,7 @@ impl DesktopConfig {
                 .unwrap_or(42420),
             data_dir,
             db_path,
-            frontend_dist: std::env::var("ORCH_FRONTEND_DIST")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("apps/control-ui/dist")),
+            frontend_dist: default_frontend_dist(),
             secret_service_name: "enterprise-orchestration".into(),
         }
     }
@@ -51,6 +49,30 @@ impl Default for DesktopConfig {
     fn default() -> Self {
         Self::from_env()
     }
+}
+
+fn default_frontend_dist() -> PathBuf {
+    if let Ok(path) = std::env::var("ORCH_FRONTEND_DIST") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(executable) = std::env::current_exe() {
+        for ancestor in executable.ancestors() {
+            if ancestor.ends_with("target") {
+                let candidate = ancestor
+                    .parent()
+                    .unwrap_or(ancestor)
+                    .join("apps/control-ui/dist");
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("apps/control-ui/dist")
 }
 
 #[derive(Debug, Clone, Serialize)]
