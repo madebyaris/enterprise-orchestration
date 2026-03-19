@@ -1,14 +1,433 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use std::{convert::Infallible, time::Duration};
+
+use anyhow::Result;
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
+    routing::{get, post},
+    Json, Router,
+};
+use domain::{
+    EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile, NewProject, NewRun,
+    NewWorkflowTemplate, Project, Run, WorkflowTemplate,
+};
+use futures_util::StreamExt;
+use observability::EventBus;
+use persistence::OrchestratorStore;
+use serde::Serialize;
+use serde_json::json;
+use tokio_stream::wrappers::BroadcastStream;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub store: OrchestratorStore,
+    pub events: EventBus,
+}
+
+impl AppState {
+    pub fn in_memory() -> Result<Self> {
+        Ok(Self {
+            store: OrchestratorStore::open_in_memory()?,
+            events: EventBus::default(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+#[derive(Debug)]
+pub struct ApiError(anyhow::Error);
+
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        Self(error)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: self.0.to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+pub fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/executors", get(list_executors).post(create_executor))
+        .route("/api/workflows", get(list_workflows).post(create_workflow))
+        .route("/api/runs", get(list_runs).post(create_run))
+        .route("/api/approvals", get(list_approvals))
+        .route("/api/events/stream", get(stream_events))
+        .route("/api/events/test", post(publish_test_event))
+        .with_state(state)
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Project>>, ApiError> {
+    Ok(Json(state.store.list_projects()?))
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    Json(input): Json<NewProject>,
+) -> Result<(StatusCode, Json<Project>), ApiError> {
+    let project = state.store.create_project(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::Project,
+            "project.created",
+            format!("Created project {}", project.name),
+            json!({"project_id": project.id}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(project)))
+}
+
+async fn list_executors(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ExecutorProfile>>, ApiError> {
+    Ok(Json(state.store.list_executor_profiles()?))
+}
+
+async fn create_executor(
+    State(state): State<AppState>,
+    Json(input): Json<NewExecutorProfile>,
+) -> Result<(StatusCode, Json<ExecutorProfile>), ApiError> {
+    let profile = state.store.create_executor_profile(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::Executor,
+            "executor.created",
+            format!("Created executor profile {}", profile.name),
+            json!({"executor_profile_id": profile.id, "kind": profile.kind}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(profile)))
+}
+
+async fn list_workflows(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<WorkflowTemplate>>, ApiError> {
+    Ok(Json(state.store.list_workflows()?))
+}
+
+async fn create_workflow(
+    State(state): State<AppState>,
+    Json(input): Json<NewWorkflowTemplate>,
+) -> Result<(StatusCode, Json<WorkflowTemplate>), ApiError> {
+    let workflow = state.store.create_workflow(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::Workflow,
+            "workflow.created",
+            format!("Created workflow {}", workflow.name),
+            json!({"workflow_id": workflow.id, "step_count": workflow.steps.len()}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(workflow)))
+}
+
+async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<Run>>, ApiError> {
+    Ok(Json(state.store.list_runs()?))
+}
+
+async fn create_run(
+    State(state): State<AppState>,
+    Json(input): Json<NewRun>,
+) -> Result<(StatusCode, Json<Run>), ApiError> {
+    let run = state.store.create_run(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::Run,
+            "run.created",
+            "Queued workflow run",
+            json!({"run_id": run.id, "workflow_template_id": run.workflow_template_id}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(run)))
+}
+
+async fn list_approvals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<domain::ApprovalGate>>, ApiError> {
+    Ok(Json(state.store.list_approval_gates()?))
+}
+
+async fn stream_events(
+    State(state): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|item| async move {
+        match item {
+            Ok(event) => Event::default()
+                .event(event.event_type.clone())
+                .json_data(event)
+                .ok()
+                .map(Ok),
+            Err(_) => None,
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+}
+
+async fn publish_test_event(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<EventEnvelope>), ApiError> {
+    let event = EventEnvelope::new(
+        EventScope::System,
+        "system.test",
+        "Published test event",
+        json!({"source": "api"}),
+    );
+    emit_event(&state, event.clone())?;
+    Ok((StatusCode::CREATED, Json(event)))
+}
+
+fn emit_event(state: &AppState, event: EventEnvelope) -> Result<(), ApiError> {
+    state.store.record_event(&event)?;
+    state.events.publish(event);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use domain::{ApprovalGate, EventEnvelope, ExecutorKind, Run};
+    use tower::util::ServiceExt;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    use super::{app, AppState};
+
+    #[tokio::test]
+    async fn creates_and_lists_projects() {
+        let state = AppState::in_memory().expect("state");
+        let app = app(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Mission Control",
+                            "description": "Desktop control plane",
+                            "workspace_path": "/workspace/mission-control",
+                            "repository_url": "https://github.com/example/mission-control",
+                            "default_executor_profile_id": null
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/projects")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let projects: Vec<domain::Project> = serde_json::from_slice(&body).expect("projects");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "Mission Control");
+    }
+
+    #[tokio::test]
+    async fn creates_workflow_and_run_rows() {
+        let state = AppState::in_memory().expect("state");
+        let project = state
+            .store
+            .create_project(domain::NewProject {
+                name: "Enterprise Orchestration".into(),
+                description: None,
+                workspace_path: "/workspace".into(),
+                repository_url: None,
+                default_executor_profile_id: None,
+            })
+            .expect("project");
+        let executor = state
+            .store
+            .create_executor_profile(domain::NewExecutorProfile {
+                name: "nca".into(),
+                kind: ExecutorKind::NativeCliAi,
+                binary_path: Some("nca".into()),
+                config_json: serde_json::json!({}),
+            })
+            .expect("executor");
+
+        let app = app(state.clone());
+
+        let workflow_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": project.id,
+                            "name": "Repo audit",
+                            "description": "Plan and review",
+                            "steps": [{
+                                "name": "Plan",
+                                "instruction": "Inspect the repo and create a plan",
+                                "order_index": 0,
+                                "executor_kind": "native_cli_ai",
+                                "depends_on_step_id": null,
+                                "timeout_seconds": 300,
+                                "retry_limit": 1,
+                                "requires_approval": true
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(workflow_response.status(), StatusCode::CREATED);
+
+        let workflow_body = to_bytes(workflow_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let workflow: domain::WorkflowTemplate =
+            serde_json::from_slice(&workflow_body).expect("workflow");
+
+        let run_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": project.id,
+                            "workflow_template_id": workflow.id,
+                            "executor_profile_id": executor.id,
+                            "requested_by": "operator"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(run_response.status(), StatusCode::CREATED);
+
+        let run_body = to_bytes(run_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let run: Run = serde_json::from_slice(&run_body).expect("run");
+        assert_eq!(run.status, domain::RunStatus::Queued);
+
+        let runs = state.store.list_runs().expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run.id);
+    }
+
+    #[tokio::test]
+    async fn publishes_test_events_to_subscribers() {
+        let state = AppState::in_memory().expect("state");
+        let mut receiver = state.events.subscribe();
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/test")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let event: EventEnvelope = serde_json::from_slice(&body).expect("event");
+        assert_eq!(event.event_type, "system.test");
+
+        let received = receiver.recv().await.expect("published event");
+        assert_eq!(received.id, event.id);
+    }
+
+    #[tokio::test]
+    async fn approvals_endpoint_returns_json() {
+        let state = AppState::in_memory().expect("state");
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/approvals")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let approvals: Vec<ApprovalGate> = serde_json::from_slice(&body).expect("approvals");
+        assert!(approvals.is_empty());
     }
 }

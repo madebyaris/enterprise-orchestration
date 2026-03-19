@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2024"
+edition = "2021"
 license = "Apache-2.0"
 version = "0.1.0"
 
@@ -34,4 +34,4 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1.18", features = ["serde", "v4"] }
+uuid = { version = "=1.11.0", features = ["serde", "v4"] }
