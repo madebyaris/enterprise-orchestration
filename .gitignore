@@ -1,0 +1,28 @@
+# Node
+node_modules/
+dist/
+.pnpm-store/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Tauri / app data
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime data
+.orchestrator/

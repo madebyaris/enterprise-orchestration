@@ -1,0 +1,12 @@
+{
+  "name": "enterprise-orchestration",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.32.0",
+  "scripts": {
+    "build": "pnpm --filter control-ui build",
+    "dev:ui": "pnpm --filter control-ui dev",
+    "lint": "pnpm --filter control-ui lint",
+    "preview:ui": "pnpm --filter control-ui preview"
+  }
+}
