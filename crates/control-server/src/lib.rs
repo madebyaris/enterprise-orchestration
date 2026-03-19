@@ -2,7 +2,7 @@ use std::{convert::Infallible, time::Duration};
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -12,13 +12,14 @@ use axum::{
     Json, Router,
 };
 use domain::{
-    EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile, NewProject, NewRun,
-    NewWorkflowTemplate, Project, Run, WorkflowTemplate,
+    ApprovalGate, EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile, NewProject,
+    NewRun, NewWorkflowTemplate, Project, Run, WorkflowTemplate,
 };
 use futures_util::StreamExt;
 use observability::EventBus;
+use orchestrator::{RunOrchestrator, RunStateSnapshot};
 use persistence::OrchestratorStore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -49,6 +50,12 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ApprovalResolutionRequest {
+    resolved_by: Option<String>,
+    notes: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct ApiError(anyhow::Error);
 
@@ -77,7 +84,15 @@ pub fn app(state: AppState) -> Router {
         .route("/api/executors", get(list_executors).post(create_executor))
         .route("/api/workflows", get(list_workflows).post(create_workflow))
         .route("/api/runs", get(list_runs).post(create_run))
+        .route("/api/runs/{run_id}", get(get_run))
+        .route(
+            "/api/runs/{run_id}/steps/{run_step_id}/complete",
+            post(complete_run_step),
+        )
         .route("/api/approvals", get(list_approvals))
+        .route("/api/approvals/{approval_id}/approve", post(approve_gate))
+        .route("/api/approvals/{approval_id}/reject", post(reject_gate))
+        .route("/api/events", get(list_events))
         .route("/api/events/stream", get(stream_events))
         .route("/api/events/test", post(publish_test_event))
         .with_state(state)
@@ -166,24 +181,66 @@ async fn list_runs(State(state): State<AppState>) -> Result<Json<Vec<Run>>, ApiE
 async fn create_run(
     State(state): State<AppState>,
     Json(input): Json<NewRun>,
-) -> Result<(StatusCode, Json<Run>), ApiError> {
-    let run = state.store.create_run(input)?;
-    emit_event(
-        &state,
-        EventEnvelope::new(
-            EventScope::Run,
-            "run.created",
-            "Queued workflow run",
-            json!({"run_id": run.id, "workflow_template_id": run.workflow_template_id}),
-        ),
-    )?;
-    Ok((StatusCode::CREATED, Json(run)))
+) -> Result<(StatusCode, Json<RunStateSnapshot>), ApiError> {
+    let orchestrator = RunOrchestrator::new(state.store.clone(), state.events.clone());
+    let snapshot = orchestrator.start_run(input)?;
+    Ok((StatusCode::CREATED, Json(snapshot)))
+}
+
+async fn get_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<RunStateSnapshot>, ApiError> {
+    let run_id = uuid::Uuid::parse_str(&run_id).map_err(anyhow::Error::from)?;
+    let orchestrator = RunOrchestrator::new(state.store.clone(), state.events.clone());
+    Ok(Json(orchestrator.snapshot(run_id)?))
+}
+
+async fn complete_run_step(
+    State(state): State<AppState>,
+    Path((_run_id, run_step_id)): Path<(String, String)>,
+) -> Result<Json<RunStateSnapshot>, ApiError> {
+    let run_step_id = uuid::Uuid::parse_str(&run_step_id).map_err(anyhow::Error::from)?;
+    let orchestrator = RunOrchestrator::new(state.store.clone(), state.events.clone());
+    Ok(Json(orchestrator.complete_running_step(run_step_id)?))
 }
 
 async fn list_approvals(
     State(state): State<AppState>,
-) -> Result<Json<Vec<domain::ApprovalGate>>, ApiError> {
+) -> Result<Json<Vec<ApprovalGate>>, ApiError> {
     Ok(Json(state.store.list_approval_gates()?))
+}
+
+async fn approve_gate(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    Json(input): Json<ApprovalResolutionRequest>,
+) -> Result<Json<RunStateSnapshot>, ApiError> {
+    let approval_id = uuid::Uuid::parse_str(&approval_id).map_err(anyhow::Error::from)?;
+    let orchestrator = RunOrchestrator::new(state.store.clone(), state.events.clone());
+    Ok(Json(orchestrator.approve_gate(
+        approval_id,
+        input.resolved_by,
+        input.notes,
+    )?))
+}
+
+async fn reject_gate(
+    State(state): State<AppState>,
+    Path(approval_id): Path<String>,
+    Json(input): Json<ApprovalResolutionRequest>,
+) -> Result<Json<RunStateSnapshot>, ApiError> {
+    let approval_id = uuid::Uuid::parse_str(&approval_id).map_err(anyhow::Error::from)?;
+    let orchestrator = RunOrchestrator::new(state.store.clone(), state.events.clone());
+    Ok(Json(orchestrator.reject_gate(
+        approval_id,
+        input.resolved_by,
+        input.notes,
+    )?))
+}
+
+async fn list_events(State(state): State<AppState>) -> Result<Json<Vec<EventEnvelope>>, ApiError> {
+    Ok(Json(state.store.list_events()?))
 }
 
 async fn stream_events(
@@ -228,7 +285,8 @@ mod tests {
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
-    use domain::{ApprovalGate, EventEnvelope, ExecutorKind, Run};
+    use domain::{ApprovalGate, EventEnvelope, ExecutorKind, RunStatus};
+    use orchestrator::RunStateSnapshot;
     use tower::util::ServiceExt;
 
     use super::{app, AppState};
@@ -371,12 +429,130 @@ mod tests {
         let run_body = to_bytes(run_response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let run: Run = serde_json::from_slice(&run_body).expect("run");
-        assert_eq!(run.status, domain::RunStatus::Queued);
+        let snapshot: RunStateSnapshot = serde_json::from_slice(&run_body).expect("snapshot");
+        assert_eq!(snapshot.run.status, RunStatus::WaitingForApproval);
+        assert!(snapshot.pending_approval.is_some());
 
         let runs = state.store.list_runs().expect("runs");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].id, run.id);
+        assert_eq!(runs[0].id, snapshot.run.id);
+    }
+
+    #[tokio::test]
+    async fn approval_action_endpoints_progress_runs() {
+        let state = AppState::in_memory().expect("state");
+        let project = state
+            .store
+            .create_project(domain::NewProject {
+                name: "Approval project".into(),
+                description: None,
+                workspace_path: "/workspace".into(),
+                repository_url: None,
+                default_executor_profile_id: None,
+            })
+            .expect("project");
+        let executor = state
+            .store
+            .create_executor_profile(domain::NewExecutorProfile {
+                name: "nca".into(),
+                kind: ExecutorKind::NativeCliAi,
+                binary_path: Some("nca".into()),
+                config_json: serde_json::json!({}),
+            })
+            .expect("executor");
+        let workflow = state
+            .store
+            .create_workflow(domain::NewWorkflowTemplate {
+                project_id: Some(project.id),
+                name: "Approval flow".into(),
+                description: None,
+                steps: vec![domain::NewWorkflowStep {
+                    name: "Gate".into(),
+                    instruction: "Wait for approval".into(),
+                    order_index: 0,
+                    executor_kind: ExecutorKind::NativeCliAi,
+                    depends_on_step_id: None,
+                    timeout_seconds: None,
+                    retry_limit: 0,
+                    requires_approval: true,
+                }],
+            })
+            .expect("workflow");
+
+        let app = app(state.clone());
+        let run_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "project_id": project.id,
+                            "workflow_template_id": workflow.id,
+                            "executor_profile_id": executor.id,
+                            "requested_by": "operator"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let run_body = to_bytes(run_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let waiting: RunStateSnapshot = serde_json::from_slice(&run_body).expect("snapshot");
+        let approval_id = waiting.pending_approval.expect("approval").id;
+        let run_step_id = waiting.run_steps[0].id;
+
+        let approve_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/approvals/{approval_id}/approve"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "resolved_by": "operator",
+                            "notes": "Ship it"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(approve_response.status(), StatusCode::OK);
+        let approve_body = to_bytes(approve_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let approved: RunStateSnapshot =
+            serde_json::from_slice(&approve_body).expect("approved snapshot");
+        assert_eq!(approved.run.status, RunStatus::Running);
+
+        let complete_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/runs/{}/steps/{run_step_id}/complete",
+                        waiting.run.id
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(complete_response.status(), StatusCode::OK);
+        let complete_body = to_bytes(complete_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let completed: RunStateSnapshot =
+            serde_json::from_slice(&complete_body).expect("completed snapshot");
+        assert_eq!(completed.run.status, RunStatus::Completed);
     }
 
     #[tokio::test]

@@ -398,6 +398,7 @@ dependencies = [
  "futures-util",
  "http",
  "observability",
+ "orchestrator",
  "persistence",
  "serde",
  "serde_json",
@@ -406,6 +407,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2235,6 +2237,7 @@ dependencies = [
  "domain",
  "observability",
  "persistence",
+ "serde",
  "serde_json",
  "uuid",
 ]

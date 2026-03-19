@@ -5,6 +5,7 @@ use domain::{
 };
 use observability::EventBus;
 use persistence::OrchestratorStore;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -15,7 +16,7 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunStateSnapshot {
     pub run: Run,
     pub run_steps: Vec<RunStep>,
