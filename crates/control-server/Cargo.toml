@@ -1,0 +1,24 @@
+[package]
+name = "control-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+domain = { path = "../domain" }
+futures-util.workspace = true
+http.workspace = true
+observability = { path = "../observability" }
+orchestrator = { path = "../orchestrator" }
+persistence = { path = "../persistence" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
