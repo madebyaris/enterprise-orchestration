@@ -1,0 +1,381 @@
+---
+description: "Tauri desktop development: Tauri v2, Rust backend integration, React frontend, desktop-core patterns, and cross-platform desktop app architecture"
+globs: ["apps/desktop/**", "crates/desktop-core/**", "**/src-tauri/**", "**/tauri.conf.json", "**/tauri.conf.ts"]
+alwaysApply: false
+---
+
+# Tauri Desktop Development
+
+Tauri v2 patterns for building desktop applications with a Rust backend and web frontend.
+
+## Tauri Workflow
+
+Before changing Tauri code:
+
+```text
+1. Read the existing Cargo.toml and tauri.conf.json/ts first
+2. Understand the Rust crate structure and frontend layout
+3. For Tauri v2, use @tauri-apps/api v2 and @tauri-apps/plugin-* for plugins
+4. Never manually edit src-tauri/target/ or generated files
+```
+
+### CLI-First Tauri Development
+
+```bash
+# Create a new Tauri project
+pnpm create tauri-app@latest my-app
+
+# Development (from apps/desktop)
+pnpm dev:desktop
+
+# Build for production
+pnpm build:desktop
+
+# Run Rust tests
+cargo test --workspace
+
+# Check Rust code
+cargo check
+cargo clippy
+```
+
+### Tauri v2 Key Differences
+
+- Uses `@tauri-apps/api` v2 (not v1)
+- Plugins are separate crates: `@tauri-apps/plugin-*`
+- IPC via `invoke()` and `emit()`/`listen()`
+- No more appveyor/changelog files in v2
+- Permissions system replaces allowlist
+
+### Post-Edit Verification
+
+After meaningful Tauri changes:
+
+```bash
+# Rust side
+cargo check
+cargo test -p control-server
+
+# Frontend side
+pnpm build
+
+# Desktop build
+pnpm build:desktop
+```
+
+---
+
+## Tauri App Structure
+
+```
+apps/desktop/
+├── src-tauri/
+│   ├── src/
+│   │   ├── lib.rs           # Crate root
+│   │   ├── main.rs          # Binary entry
+│   │   └── capabilities/    # Permission definitions
+│   ├── Cargo.toml
+│   ├── tauri.conf.json      # App config
+│   └── build.rs             # Build script
+├── src/                     # React frontend (if separate)
+└── package.json
+```
+
+### Cargo.toml Dependencies (Tauri v2)
+
+```toml
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+tauri-build = "2"
+```
+
+---
+
+## Frontend IPC
+
+### Calling Rust Commands
+
+```typescript
+import { invoke } from '@tauri-apps/api/core';
+
+// Call a Rust command
+const result = await invoke<string>('greet', { name: 'World' });
+```
+
+### Rust Command Definition
+
+```rust
+// src/lib.rs
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!("Hello, {}!", name)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![greet])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+```
+
+### Emitting Events
+
+```typescript
+// Frontend - listen for events
+import { listen } from '@tauri-apps/api/event';
+
+await listen('work-progress', (event) => {
+    console.log('Progress:', event.payload);
+});
+
+// Frontend - emit events
+import { emit } from '@tauri-apps/api/event';
+await emit('user-action', { action: 'clicked' });
+```
+
+```rust
+// Rust - emit events
+app.emit("work-progress", serde_json::json!({"progress": 50})).unwrap();
+```
+
+---
+
+## State Management
+
+### Accessing App State
+
+```rust
+use tauri::State;
+use std::sync::Mutex;
+
+struct AppState {
+    counter: Mutex<i32>,
+}
+
+#[tauri::command]
+fn increment(state: State<AppState>) -> i32 {
+    let mut counter = state.counter.lock().unwrap();
+    *counter += 1;
+    *counter
+}
+
+fn main() {
+    tauri::Builder::default()
+        .manage(AppState {
+            counter: Mutex::new(0),
+        })
+        .invoke_handler(tauri::generate_handler![increment])
+        .run(tauri::generate_context!())
+        .unwrap();
+}
+```
+
+---
+
+## Permissions (Tauri v2)
+
+Permissions are defined in `src-tauri/capabilities/default.json`:
+
+```json
+{
+    "$schema": "...",
+    "identifier": "default",
+    "description": "Default permissions",
+    "windows": ["main"],
+    "permissions": [
+        "core:default",
+        "core:event:default",
+        "shell:allow-open"
+    ]
+}
+```
+
+### Custom Permissions
+
+```json
+{
+    "identifier": "custom-permission",
+    "windows": ["main"],
+    "permissions": [
+        "core:default",
+        {
+            "identifier": "my-plugin:allow-do-something",
+            "allow": [{ "path": "$APPDATA/**" }]
+        }
+    ]
+}
+```
+
+---
+
+## Window Management
+
+```typescript
+import { getCurrentWindow } from '@tauri-apps/api/window';
+
+const window = getCurrentWindow();
+
+// Minimize
+await window.minimize();
+
+// Maximize/unmaximize
+await window.toggleMaximize();
+
+// Set title
+await window.setTitle('New Title');
+
+// Close
+await window.close();
+```
+
+---
+
+## Dialog and Native Features
+
+```typescript
+import { ask, message, open as openDialog } from '@tauri-apps/plugin-dialog';
+
+// Show confirmation
+const confirmed = await ask('Are you sure?', {
+    title: 'Confirm',
+    kind: 'warning',
+});
+
+// Open file dialog
+const selected = await openDialog({
+    multiple: false,
+    filters: [{ name: 'Images', extensions: ['png', 'jpg'] }],
+});
+```
+
+---
+
+## Common Patterns
+
+### Async Command Handlers
+
+```rust
+#[tauri::command]
+async fn long_running_task(
+    window: tauri::Window,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    // Emit progress updates
+    window.emit("progress", serde_json::json!({"value": 25})).unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    window.emit("progress", serde_json::json!({"value": 50})).unwrap();
+
+    Ok("completed".to_string())
+}
+```
+
+### Error Handling in Commands
+
+```rust
+#[tauri::command]
+fn risky_operation() -> Result<String, String> {
+    if some_condition {
+        Ok("success".to_string())
+    } else {
+        Err("operation failed: condition not met".to_string())
+    }
+}
+```
+
+---
+
+## Rust Integration Pattern (Enterprise Orchestration)
+
+This project uses a multi-crate architecture:
+
+```
+crates/desktop-core/  → Tauri integration layer
+crates/control-server/ → Embedded Axum HTTP server
+crates/domain/        → Shared types
+crates/orchestrator/  → Workflow execution engine
+```
+
+### Command Routing Pattern
+
+```rust
+// In desktop-core/src/lib.rs
+#[tauri::command]
+async fn run_workflow(
+    app: tauri::AppHandle,
+    workflow_id: String,
+) -> Result<String, String> {
+    let orchestrator = app.state::<OrchestratorHandle>();
+    orchestrator.run(workflow_id).await.map_err(|e| e.to_string())
+}
+```
+
+---
+
+## Build Configuration
+
+### tauri.conf.json
+
+```json
+{
+    "productName": "Enterprise Orchestration",
+    "version": "0.1.0",
+    "identifier": "com.orchestration.app",
+    "build": {
+        "devtools": true
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "Enterprise Orchestration",
+                "width": 1200,
+                "height": 800,
+                "resizable": true,
+                "fullscreen": false
+            }
+        ]
+    }
+}
+```
+
+---
+
+## Testing
+
+### Rust Tests
+
+```bash
+# Run all workspace tests
+cargo test --workspace
+
+# Run specific crate tests
+cargo test -p control-server
+
+# Run with output
+cargo test -- --nocapture
+```
+
+### Integration Testing
+
+For Tauri integration tests, use `tauri-test`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use tauri::test::{assert_eq, assert_returns_data};
+
+    #[test]
+    fn test_command() {
+        // Integration test setup
+    }
+}
+```
