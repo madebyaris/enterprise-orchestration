@@ -13,13 +13,16 @@ use axum::{
     Json, Router,
 };
 use domain::{
-    ApprovalGate, Artifact, EventEnvelope, EventScope, ExecutorProfile, NewExecutorProfile,
-    NewProject, NewRun, NewWorkflowTemplate, PairingSession, Project, Run, WorkflowTemplate,
+    AgentRole, ApprovalGate, Artifact, EventEnvelope, EventScope, ExecutorProfile, GoalSpec,
+    NewAgentRole, NewExecutorProfile, NewGoalSpec, NewProject, NewRun, NewSkillDefinition,
+    NewWorkflowTemplate, PairingSession, Project, Run, SkillDefinition, WorkflowTemplate,
 };
+use executors::{default_health_checks, ExecutorHealth};
 use futures_util::StreamExt;
 use observability::EventBus;
-use orchestrator::{RunOrchestrator, RunStateSnapshot};
+use orchestrator::{CompiledGoal, RunOrchestrator, RunStateSnapshot, SuperOwner};
 use persistence::OrchestratorStore;
+use runtime::{ProjectContextService, ProjectContextSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_stream::wrappers::BroadcastStream;
@@ -71,6 +74,21 @@ struct PairingSessionResponse {
     remote_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct NewSkillBindingRequest {
+    skill_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompileGoalRequest {
+    agents_md_override: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectContextResponse {
+    snapshot: ProjectContextSnapshot,
+}
+
 #[derive(Debug)]
 pub struct ApiError(anyhow::Error);
 
@@ -97,7 +115,14 @@ pub fn app(state: AppState) -> Router {
     let api_router = Router::new()
         .route("/health", get(health))
         .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/projects/{project_id}/context", get(get_project_context))
         .route("/api/executors", get(list_executors).post(create_executor))
+        .route("/api/executors/health", get(list_executor_health))
+        .route("/api/roles", get(list_roles).post(create_role))
+        .route("/api/roles/{role_id}/skills", post(bind_skill_to_role))
+        .route("/api/skills", get(list_skills).post(create_skill))
+        .route("/api/goals", get(list_goals).post(create_goal))
+        .route("/api/goals/{goal_id}/compile", post(compile_goal))
         .route("/api/workflows", get(list_workflows).post(create_workflow))
         .route("/api/runs", get(list_runs).post(create_run))
         .route("/api/runs/{run_id}", get(get_run))
@@ -164,7 +189,16 @@ async fn create_project(
     State(state): State<AppState>,
     Json(input): Json<NewProject>,
 ) -> Result<(StatusCode, Json<Project>), ApiError> {
-    let project = state.store.create_project(input)?;
+    let mut project = state.store.create_project(input)?;
+    if std::path::Path::new(&project.workspace_path).exists() {
+        if let Ok(snapshot) = ProjectContextService::default().discover(&project.workspace_path) {
+            project = state.store.update_project_agents_md(
+                project.id,
+                snapshot.root_agents_md.as_ref().map(|doc| doc.path.clone()),
+                Some(snapshot.discovered_at),
+            )?;
+        }
+    }
     emit_event(
         &state,
         EventEnvelope::new(
@@ -177,10 +211,32 @@ async fn create_project(
     Ok((StatusCode::CREATED, Json(project)))
 }
 
+async fn get_project_context(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectContextResponse>, ApiError> {
+    let project_id = uuid::Uuid::parse_str(&project_id).map_err(anyhow::Error::from)?;
+    let project = state
+        .store
+        .get_project(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("project {project_id} not found"))?;
+    let snapshot = ProjectContextService::default().discover(&project.workspace_path)?;
+    let _ = state.store.update_project_agents_md(
+        project.id,
+        snapshot.root_agents_md.as_ref().map(|doc| doc.path.clone()),
+        Some(snapshot.discovered_at),
+    )?;
+    Ok(Json(ProjectContextResponse { snapshot }))
+}
+
 async fn list_executors(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ExecutorProfile>>, ApiError> {
     Ok(Json(state.store.list_executor_profiles()?))
+}
+
+async fn list_executor_health() -> Result<Json<Vec<ExecutorHealth>>, ApiError> {
+    Ok(Json(default_health_checks()))
 }
 
 async fn create_executor(
@@ -198,6 +254,111 @@ async fn create_executor(
         ),
     )?;
     Ok((StatusCode::CREATED, Json(profile)))
+}
+
+async fn list_roles(State(state): State<AppState>) -> Result<Json<Vec<AgentRole>>, ApiError> {
+    Ok(Json(state.store.list_agent_roles()?))
+}
+
+async fn create_role(
+    State(state): State<AppState>,
+    Json(input): Json<NewAgentRole>,
+) -> Result<(StatusCode, Json<AgentRole>), ApiError> {
+    let role = state.store.create_agent_role(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::System,
+            "role.created",
+            format!("Created role {}", role.name),
+            json!({"role_id": role.id}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(role)))
+}
+
+async fn list_skills(State(state): State<AppState>) -> Result<Json<Vec<SkillDefinition>>, ApiError> {
+    Ok(Json(state.store.list_skills()?))
+}
+
+async fn create_skill(
+    State(state): State<AppState>,
+    Json(input): Json<NewSkillDefinition>,
+) -> Result<(StatusCode, Json<SkillDefinition>), ApiError> {
+    let skill = state.store.create_skill(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::System,
+            "skill.created",
+            format!("Created skill {}", skill.name),
+            json!({"skill_id": skill.id}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(skill)))
+}
+
+async fn bind_skill_to_role(
+    State(state): State<AppState>,
+    Path(role_id): Path<String>,
+    Json(input): Json<NewSkillBindingRequest>,
+) -> Result<(StatusCode, Json<domain::SkillBinding>), ApiError> {
+    let role_id = uuid::Uuid::parse_str(&role_id).map_err(anyhow::Error::from)?;
+    let skill_id = uuid::Uuid::parse_str(&input.skill_id).map_err(anyhow::Error::from)?;
+    let binding = state.store.bind_skill_to_role(role_id, skill_id)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::System,
+            "role.skill_bound",
+            "Attached skill to role",
+            json!({"role_id": role_id, "skill_id": skill_id}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(binding)))
+}
+
+async fn list_goals(State(state): State<AppState>) -> Result<Json<Vec<GoalSpec>>, ApiError> {
+    Ok(Json(state.store.list_goals()?))
+}
+
+async fn create_goal(
+    State(state): State<AppState>,
+    Json(input): Json<NewGoalSpec>,
+) -> Result<(StatusCode, Json<GoalSpec>), ApiError> {
+    let goal = state.store.create_goal(input)?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::Workflow,
+            "goal.created",
+            format!("Created goal {}", goal.title),
+            json!({"goal_id": goal.id, "kind": goal.kind.as_str()}),
+        ),
+    )?;
+    Ok((StatusCode::CREATED, Json(goal)))
+}
+
+async fn compile_goal(
+    State(state): State<AppState>,
+    Path(goal_id): Path<String>,
+    Json(input): Json<CompileGoalRequest>,
+) -> Result<Json<CompiledGoal>, ApiError> {
+    let goal_id = uuid::Uuid::parse_str(&goal_id).map_err(anyhow::Error::from)?;
+    let compiled = SuperOwner::new(state.store.clone()).compile_goal(
+        goal_id,
+        input.agents_md_override.as_deref(),
+    )?;
+    emit_event(
+        &state,
+        EventEnvelope::new(
+            EventScope::Workflow,
+            "goal.compiled",
+            format!("Compiled workflow {}", compiled.workflow.name),
+            json!({"goal_id": compiled.goal.id, "workflow_id": compiled.workflow.id}),
+        ),
+    )?;
+    Ok(Json(compiled))
 }
 
 async fn list_workflows(
@@ -670,10 +831,15 @@ mod tests {
                     instruction: "Wait for approval".into(),
                     order_index: 0,
                     executor_kind: ExecutorKind::NativeCliAi,
+                    role_id: None,
                     depends_on_step_id: None,
                     timeout_seconds: None,
                     retry_limit: 0,
                     requires_approval: true,
+                    success_criteria: None,
+                    artifact_contract: None,
+                    input_schema: serde_json::json!({}),
+                    output_schema: serde_json::json!({}),
                 }],
             })
             .expect("workflow");
@@ -887,10 +1053,21 @@ mod tests {
 
     #[tokio::test]
     async fn serves_frontend_index_when_dist_is_configured() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let frontend_dist = manifest_dir
+            .join("../../../apps/control-ui/dist")
+            .canonicalize()
+            .ok();
+
+        if frontend_dist.is_none() {
+            eprintln!("Skipping test: apps/control-ui/dist not found");
+            return;
+        }
+
         let state = AppState {
             store: OrchestratorStore::open_in_memory().expect("store"),
             events: EventBus::default(),
-            frontend_dist: Some(PathBuf::from("/workspace/apps/control-ui/dist")),
+            frontend_dist,
         };
         let app = app(state);
 

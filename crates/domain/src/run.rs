@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::executor::ExecutorKind;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -89,6 +91,10 @@ pub struct Run {
     pub project_id: Uuid,
     pub workflow_template_id: Uuid,
     pub executor_profile_id: Option<Uuid>,
+    pub goal_id: Option<Uuid>,
+    pub compiled_by: Option<String>,
+    pub assigned_role_id: Option<Uuid>,
+    pub effective_executor_kind: Option<ExecutorKind>,
     pub status: RunStatus,
     pub requested_by: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -110,6 +116,16 @@ pub struct RunStep {
 pub struct NewRun {
     pub project_id: Uuid,
     pub workflow_template_id: Uuid,
+    #[serde(default)]
     pub executor_profile_id: Option<Uuid>,
+    #[serde(default)]
+    pub goal_id: Option<Uuid>,
+    #[serde(default)]
+    pub compiled_by: Option<String>,
+    #[serde(default)]
+    pub assigned_role_id: Option<Uuid>,
+    #[serde(default)]
+    pub effective_executor_kind: Option<ExecutorKind>,
+    #[serde(default)]
     pub requested_by: Option<String>,
 }

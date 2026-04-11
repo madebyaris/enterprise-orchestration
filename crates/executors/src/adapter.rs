@@ -29,6 +29,9 @@ pub struct ExecutorRunRequest {
     pub prompt: String,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub config_json: serde_json::Value,
     #[serde(default)]
     pub orchestration_env: Vec<(String, String)>,
 }

@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use control_server::{app, AppState};
 use observability::EventBus;
+use orchestrator::ExecutorDriver;
 use persistence::OrchestratorStore;
 use security::SecretManager;
 use serde::Serialize;
@@ -97,6 +98,12 @@ pub struct DesktopRuntime {
     events: EventBus,
     secrets: SecretManager,
     server: Arc<Mutex<Option<ControlServerHandle>>>,
+    executor_driver: Arc<Mutex<Option<ExecutorDriverHandle>>>,
+}
+
+struct ExecutorDriverHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
 }
 
 impl DesktopRuntime {
@@ -115,6 +122,7 @@ impl DesktopRuntime {
             events: EventBus::default(),
             secrets,
             server: Arc::new(Mutex::new(None)),
+            executor_driver: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -172,6 +180,55 @@ impl DesktopRuntime {
 
     pub async fn stop_control_server(&self) -> Result<()> {
         let mut guard = self.server.lock().await;
+        if let Some(mut handle) = guard.take() {
+            if let Some(shutdown) = handle.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            let _ = handle.task.await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn start_executor_driver(&self) -> Result<()> {
+        let mut guard = self.executor_driver.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let store = self.store.clone();
+        let events = self.events.clone();
+        let task = tokio::spawn(async move {
+            let driver = ExecutorDriver::new(store.clone(), events.clone());
+            let mut shutdown = shutdown_rx;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => {
+                        tracing::info!("executor driver shutting down");
+                        break;
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(500)) => {
+                        let orchestrator = orchestrator::RunOrchestrator::new(store.clone(), events.clone());
+                        if let Err(e) = driver.poll_and_drive_ready_steps(&orchestrator).await {
+                            tracing::error!("executor driver error: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        *guard = Some(ExecutorDriverHandle {
+            shutdown: Some(shutdown_tx),
+            task,
+        });
+
+        Ok(())
+    }
+
+    pub async fn stop_executor_driver(&self) -> Result<()> {
+        let mut guard = self.executor_driver.lock().await;
         if let Some(mut handle) = guard.take() {
             if let Some(shutdown) = handle.shutdown.take() {
                 let _ = shutdown.send(());

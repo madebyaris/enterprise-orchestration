@@ -25,6 +25,7 @@ type Project = {
   description?: string | null
   workspace_path: string
   repository_url?: string | null
+  agents_md_path?: string | null
 }
 
 type ExecutorProfile = {
@@ -34,6 +35,40 @@ type ExecutorProfile = {
   binary_path?: string | null
 }
 
+type ExecutorHealth = {
+  kind: ExecutorKind
+  available: boolean
+  binary_path?: string | null
+  version_hint?: string | null
+}
+
+type AgentRole = {
+  id: string
+  name: string
+  description?: string | null
+  system_prompt: string
+  default_executor_kind?: ExecutorKind | null
+}
+
+type SkillDefinition = {
+  id: string
+  name: string
+  description?: string | null
+  instructions: string
+  source: 'inline' | 'agents_md' | 'file' | 'remote'
+  source_uri?: string | null
+}
+
+type GoalSpec = {
+  id: string
+  project_id: string
+  kind: 'create_app' | 'create_workflow'
+  title: string
+  prompt: string
+  status: 'draft' | 'compiled' | 'running' | 'completed' | 'failed'
+  compiled_workflow_template_id?: string | null
+}
+
 type WorkflowStep = {
   id: string
   workflow_template_id: string
@@ -41,7 +76,10 @@ type WorkflowStep = {
   instruction: string
   order_index: number
   executor_kind: ExecutorKind
+  role_id?: string | null
   requires_approval: boolean
+  success_criteria?: string | null
+  artifact_contract?: string | null
 }
 
 type WorkflowTemplate = {
@@ -120,7 +158,11 @@ type RunSnapshot = {
 
 type DashboardData = {
   projects: Project[]
+  roles: AgentRole[]
+  skills: SkillDefinition[]
+  goals: GoalSpec[]
   executors: ExecutorProfile[]
+  executorHealth: ExecutorHealth[]
   workflows: WorkflowTemplate[]
   runs: Run[]
   approvals: ApprovalGate[]
@@ -128,7 +170,44 @@ type DashboardData = {
   events: EventEnvelope[]
 }
 
-type ViewKey = 'overview' | 'projects' | 'executors' | 'workflows' | 'runs'
+type AgentsSection = {
+  heading: string
+  content: string
+}
+
+type AgentsDocument = {
+  path: string
+  instructions: string
+  sections: AgentsSection[]
+}
+
+type ProjectContextSnapshot = {
+  workspace_path: string
+  root_agents_md?: AgentsDocument | null
+  nested_agents_md: AgentsDocument[]
+  discovered_at: string
+}
+
+type ProjectContextResponse = {
+  snapshot: ProjectContextSnapshot
+}
+
+type CompiledGoal = {
+  goal: GoalSpec
+  project: Project
+  workflow: WorkflowTemplate
+  agents_md?: string | null
+}
+
+type ViewKey =
+  | 'overview'
+  | 'projects'
+  | 'roles'
+  | 'skills'
+  | 'goals'
+  | 'executors'
+  | 'workflows'
+  | 'runs'
 
 const DEFAULT_API_BASE = 'http://127.0.0.1:42420'
 
@@ -183,7 +262,11 @@ function App() {
   const [view, setView] = useState<ViewKey>('overview')
   const [dashboard, setDashboard] = useState<DashboardData>({
     projects: [],
+    roles: [],
+    skills: [],
+    goals: [],
     executors: [],
+    executorHealth: [],
     workflows: [],
     runs: [],
     approvals: [],
@@ -200,6 +283,9 @@ function App() {
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null)
   const [activePairingUrl, setActivePairingUrl] = useState<string | null>(null)
   const [pairingQrDataUrl, setPairingQrDataUrl] = useState<string | null>(null)
+  const [selectedProjectContext, setSelectedProjectContext] = useState<ProjectContextSnapshot | null>(null)
+  const [selectedContextProjectId, setSelectedContextProjectId] = useState<string | null>(null)
+  const [compiledGoal, setCompiledGoal] = useState<CompiledGoal | null>(null)
 
   const [projectForm, setProjectForm] = useState({
     name: '',
@@ -212,6 +298,29 @@ function App() {
     kind: 'native_cli_ai' as ExecutorKind,
     binaryPath: 'nca',
   })
+  const [roleForm, setRoleForm] = useState({
+    name: 'CEO',
+    description: 'Sets direction and product goals.',
+    systemPrompt: 'Define direction, constraints, and desired outcomes.',
+    defaultExecutorKind: 'claude_code' as ExecutorKind,
+  })
+  const [skillForm, setSkillForm] = useState({
+    name: 'Repository guidance',
+    description: 'Reusable project guidance.',
+    instructions: 'Read and follow the repository guidance before making changes.',
+    source: 'inline' as SkillDefinition['source'],
+    sourceUri: '',
+  })
+  const [roleSkillForm, setRoleSkillForm] = useState({
+    roleId: '',
+    skillId: '',
+  })
+  const [goalForm, setGoalForm] = useState({
+    projectId: '',
+    kind: 'create_app' as GoalSpec['kind'],
+    title: 'Create app',
+    prompt: 'Create an app that matches the project goal.',
+  })
   const [workflowForm, setWorkflowForm] = useState({
     projectId: '',
     name: 'Repository audit',
@@ -219,6 +328,7 @@ function App() {
     stepName: 'Inspect repository',
     stepInstruction: 'Inspect the repository and create an operator-ready plan.',
     executorKind: 'native_cli_ai' as ExecutorKind,
+    roleId: '',
     requiresApproval: true,
   })
   const [runForm, setRunForm] = useState({
@@ -233,10 +343,14 @@ function App() {
   })
 
   const refreshDashboard = useCallback(async () => {
-    const [projects, executors, workflows, runs, approvals, pairings, events] =
+    const [projects, roles, skills, goals, executors, executorHealth, workflows, runs, approvals, pairings, events] =
       await Promise.all([
       requestJson<Project[]>('/api/projects'),
+      requestJson<AgentRole[]>('/api/roles'),
+      requestJson<SkillDefinition[]>('/api/skills'),
+      requestJson<GoalSpec[]>('/api/goals'),
       requestJson<ExecutorProfile[]>('/api/executors'),
+      requestJson<ExecutorHealth[]>('/api/executors/health'),
       requestJson<WorkflowTemplate[]>('/api/workflows'),
       requestJson<Run[]>('/api/runs'),
       requestJson<ApprovalGate[]>('/api/approvals'),
@@ -244,7 +358,19 @@ function App() {
       requestJson<EventEnvelope[]>('/api/events'),
     ])
 
-    setDashboard({ projects, executors, workflows, runs, approvals, pairings, events })
+    setDashboard({
+      projects,
+      roles,
+      skills,
+      goals,
+      executors,
+      executorHealth,
+      workflows,
+      runs,
+      approvals,
+      pairings,
+      events,
+    })
     setLastRefreshedAt(new Date())
 
     if (!selectedRunId && runs[0]) {
@@ -336,6 +462,18 @@ function App() {
   }, [activePairingUrl])
 
   useEffect(() => {
+    if (!goalForm.projectId && dashboard.projects[0]) {
+      setGoalForm((current) => ({ ...current, projectId: dashboard.projects[0].id }))
+    }
+
+    if (!roleSkillForm.roleId && dashboard.roles[0]) {
+      setRoleSkillForm((current) => ({ ...current, roleId: dashboard.roles[0].id }))
+    }
+
+    if (!roleSkillForm.skillId && dashboard.skills[0]) {
+      setRoleSkillForm((current) => ({ ...current, skillId: dashboard.skills[0].id }))
+    }
+
     if (!workflowForm.projectId && dashboard.projects[0]) {
       setWorkflowForm((current) => ({ ...current, projectId: dashboard.projects[0].id }))
     }
@@ -357,7 +495,20 @@ function App() {
         executorProfileId: dashboard.executors[0].id,
       }))
     }
-  }, [dashboard, runForm.executorProfileId, runForm.projectId, runForm.workflowTemplateId, workflowForm.projectId])
+    if (!workflowForm.roleId && dashboard.roles[0]) {
+      setWorkflowForm((current) => ({ ...current, roleId: dashboard.roles[0].id }))
+    }
+  }, [
+    dashboard,
+    goalForm.projectId,
+    roleSkillForm.roleId,
+    roleSkillForm.skillId,
+    runForm.executorProfileId,
+    runForm.projectId,
+    runForm.workflowTemplateId,
+    workflowForm.projectId,
+    workflowForm.roleId,
+  ])
 
   const projectIndex = useMemo(
     () => Object.fromEntries(dashboard.projects.map((project) => [project.id, project])),
@@ -370,6 +521,10 @@ function App() {
   const executorIndex = useMemo(
     () => Object.fromEntries(dashboard.executors.map((executor) => [executor.id, executor])),
     [dashboard.executors],
+  )
+  const roleIndex = useMemo(
+    () => Object.fromEntries(dashboard.roles.map((role) => [role.id, role])),
+    [dashboard.roles],
   )
 
   const handleAction = useCallback(
@@ -420,6 +575,83 @@ function App() {
       setSuccessMessage(`Created executor profile ${executor.name}`)
     })
 
+  const createRole = async () =>
+    handleAction('create-role', async () => {
+      const role = await requestJson<AgentRole>('/api/roles', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: roleForm.name,
+          description: roleForm.description || null,
+          system_prompt: roleForm.systemPrompt,
+          default_executor_kind: roleForm.defaultExecutorKind,
+        }),
+      })
+      setRoleSkillForm((current) => ({ ...current, roleId: role.id }))
+      setSuccessMessage(`Created role ${role.name}`)
+    })
+
+  const createSkill = async () =>
+    handleAction('create-skill', async () => {
+      const skill = await requestJson<SkillDefinition>('/api/skills', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: skillForm.name,
+          description: skillForm.description || null,
+          instructions: skillForm.instructions,
+          source: skillForm.source,
+          source_uri: skillForm.sourceUri || null,
+        }),
+      })
+      setRoleSkillForm((current) => ({ ...current, skillId: skill.id }))
+      setSuccessMessage(`Created skill ${skill.name}`)
+    })
+
+  const bindSkillToRole = async () =>
+    handleAction('bind-skill', async () => {
+      await requestJson(`/api/roles/${roleSkillForm.roleId}/skills`, {
+        method: 'POST',
+        body: JSON.stringify({
+          skill_id: roleSkillForm.skillId,
+        }),
+      })
+      setSuccessMessage('Attached skill to role')
+    })
+
+  const createGoal = async () =>
+    handleAction('create-goal', async () => {
+      const goal = await requestJson<GoalSpec>('/api/goals', {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: goalForm.projectId,
+          kind: goalForm.kind,
+          title: goalForm.title,
+          prompt: goalForm.prompt,
+        }),
+      })
+      setSuccessMessage(`Created goal ${goal.title}`)
+    })
+
+  const compileGoal = async (goalId: string) =>
+    handleAction(`compile-goal-${goalId}`, async () => {
+      const response = await requestJson<CompiledGoal>(`/api/goals/${goalId}/compile`, {
+        method: 'POST',
+        body: JSON.stringify({
+          agents_md_override:
+            selectedProjectContext?.root_agents_md?.instructions || null,
+        }),
+      })
+      setCompiledGoal(response)
+      setSuccessMessage(`Compiled workflow ${response.workflow.name}`)
+    })
+
+  const inspectProjectContext = async (projectId: string) =>
+    handleAction(`project-context-${projectId}`, async () => {
+      const response = await requestJson<ProjectContextResponse>(`/api/projects/${projectId}/context`)
+      setSelectedContextProjectId(projectId)
+      setSelectedProjectContext(response.snapshot)
+      setSuccessMessage('Loaded project guidance from AGENTS.md')
+    })
+
   const createWorkflow = async () =>
     handleAction('create-workflow', async () => {
       const workflow = await requestJson<WorkflowTemplate>('/api/workflows', {
@@ -434,10 +666,15 @@ function App() {
               instruction: workflowForm.stepInstruction,
               order_index: 0,
               executor_kind: workflowForm.executorKind,
+              role_id: workflowForm.roleId || null,
               depends_on_step_id: null,
               timeout_seconds: 300,
               retry_limit: 1,
               requires_approval: workflowForm.requiresApproval,
+              success_criteria: null,
+              artifact_contract: null,
+              input_schema: {},
+              output_schema: {},
             },
           ],
         }),
@@ -547,7 +784,9 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Primary navigation">
-          {(['overview', 'projects', 'executors', 'workflows', 'runs'] as ViewKey[]).map((item) => (
+          {(
+            ['overview', 'projects', 'roles', 'skills', 'goals', 'executors', 'workflows', 'runs'] as ViewKey[]
+          ).map((item) => (
             <button
               key={item}
               className={`nav-item ${view === item ? 'active' : ''}`}
@@ -669,18 +908,48 @@ function App() {
 
                 <div className="table-list">
                   {dashboard.projects.map((project) => (
-                    <article key={project.id} className="list-row">
+                    <article key={project.id} className="list-row stacked">
                       <div>
                         <strong>{project.name}</strong>
                         <p>{project.workspace_path}</p>
                       </div>
-                      <span className="muted">{project.repository_url || 'local-only'}</span>
+                      <div className="row-tags">
+                        <span className="muted">{project.repository_url || 'local-only'}</span>
+                        <span className="status-chip neutral">
+                          {project.agents_md_path ? 'AGENTS.md detected' : 'no AGENTS.md'}
+                        </span>
+                      </div>
+                      <button
+                        className="ghost-button"
+                        disabled={submitting !== null}
+                        onClick={() => void inspectProjectContext(project.id)}
+                      >
+                        {submitting === `project-context-${project.id}`
+                          ? 'Inspecting…'
+                          : 'Inspect AGENTS.md'}
+                      </button>
                     </article>
                   ))}
                   {!dashboard.projects.length && (
                     <div className="empty-state">No projects yet. Create one to get started.</div>
                   )}
                 </div>
+
+                {selectedProjectContext && (
+                  <div className="mini-card">
+                    <strong>
+                      Project guidance
+                      {selectedContextProjectId
+                        ? ` for ${projectIndex[selectedContextProjectId]?.name || 'project'}`
+                        : ''}
+                    </strong>
+                    <p>
+                      Root file:{' '}
+                      {selectedProjectContext.root_agents_md?.path || 'No root AGENTS.md found'}
+                    </p>
+                    <p>{selectedProjectContext.root_agents_md?.instructions || 'No AGENTS guidance loaded yet.'}</p>
+                  </div>
+                )}
               </section>
             )}
 
@@ -743,12 +1012,288 @@ function App() {
                       <strong>{executor.name}</strong>
                       <span className="status-chip neutral">{prettyStatus(executor.kind)}</span>
                       <p>{executor.binary_path || 'Using PATH lookup'}</p>
+                      <p>
+                        Health:{' '}
+                        {dashboard.executorHealth.find((health) => health.kind === executor.kind)?.available
+                          ? 'available'
+                          : 'unavailable'}
+                      </p>
                     </article>
                   ))}
                   {!dashboard.executors.length && (
                     <div className="empty-state">No executor profiles configured yet.</div>
                   )}
                 </div>
+              </section>
+            )}
+
+            {(view === 'overview' || view === 'roles') && (
+              <section className="panel">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Roles</p>
+                    <h3>Define CEO, PM, Engineer, Reviewer templates</h3>
+                  </div>
+                  <span className="status-chip neutral">{dashboard.roles.length} roles</span>
+                </div>
+
+                <div className="form-grid">
+                  <input
+                    value={roleForm.name}
+                    onChange={(event) =>
+                      setRoleForm((current) => ({ ...current, name: event.target.value }))
+                    }
+                    placeholder="Role name"
+                  />
+                  <select
+                    value={roleForm.defaultExecutorKind}
+                    onChange={(event) =>
+                      setRoleForm((current) => ({
+                        ...current,
+                        defaultExecutorKind: event.target.value as ExecutorKind,
+                      }))
+                    }
+                  >
+                    <option value="native_cli_ai">native-cli-ai</option>
+                    <option value="claude_code">Claude Code</option>
+                    <option value="codex">Codex CLI</option>
+                    <option value="opencode">OpenCode</option>
+                    <option value="shell">Shell</option>
+                  </select>
+                  <input
+                    value={roleForm.description}
+                    onChange={(event) =>
+                      setRoleForm((current) => ({ ...current, description: event.target.value }))
+                    }
+                    placeholder="Role description"
+                  />
+                </div>
+                <textarea
+                  value={roleForm.systemPrompt}
+                  onChange={(event) =>
+                    setRoleForm((current) => ({ ...current, systemPrompt: event.target.value }))
+                  }
+                  placeholder="Role system prompt"
+                />
+                <button
+                  className="primary-button"
+                  disabled={!roleForm.name || !roleForm.systemPrompt || submitting !== null}
+                  onClick={() => void createRole()}
+                >
+                  {submitting === 'create-role' ? 'Creating…' : 'Create role'}
+                </button>
+
+                <div className="card-grid">
+                  {dashboard.roles.map((role) => (
+                    <article key={role.id} className="mini-card">
+                      <strong>{role.name}</strong>
+                      <span className="status-chip neutral">
+                        {prettyStatus(role.default_executor_kind || 'shell')}
+                      </span>
+                      <p>{role.description || role.system_prompt}</p>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {(view === 'overview' || view === 'skills') && (
+              <section className="panel">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Skills</p>
+                    <h3>Attach reusable guidance to roles</h3>
+                  </div>
+                  <span className="status-chip neutral">{dashboard.skills.length} skills</span>
+                </div>
+
+                <div className="form-grid">
+                  <input
+                    value={skillForm.name}
+                    onChange={(event) =>
+                      setSkillForm((current) => ({ ...current, name: event.target.value }))
+                    }
+                    placeholder="Skill name"
+                  />
+                  <select
+                    value={skillForm.source}
+                    onChange={(event) =>
+                      setSkillForm((current) => ({
+                        ...current,
+                        source: event.target.value as SkillDefinition['source'],
+                      }))
+                    }
+                  >
+                    <option value="inline">Inline</option>
+                    <option value="agents_md">AGENTS.md</option>
+                    <option value="file">File</option>
+                    <option value="remote">Remote</option>
+                  </select>
+                  <input
+                    value={skillForm.description}
+                    onChange={(event) =>
+                      setSkillForm((current) => ({
+                        ...current,
+                        description: event.target.value,
+                      }))
+                    }
+                    placeholder="Skill description"
+                  />
+                </div>
+                <textarea
+                  value={skillForm.instructions}
+                  onChange={(event) =>
+                    setSkillForm((current) => ({
+                      ...current,
+                      instructions: event.target.value,
+                    }))
+                  }
+                  placeholder="Skill instructions"
+                />
+                <button
+                  className="primary-button"
+                  disabled={!skillForm.name || !skillForm.instructions || submitting !== null}
+                  onClick={() => void createSkill()}
+                >
+                  {submitting === 'create-skill' ? 'Creating…' : 'Create skill'}
+                </button>
+
+                <div className="form-grid">
+                  <select
+                    value={roleSkillForm.roleId}
+                    onChange={(event) =>
+                      setRoleSkillForm((current) => ({ ...current, roleId: event.target.value }))
+                    }
+                  >
+                    <option value="">Select role</option>
+                    {dashboard.roles.map((role) => (
+                      <option key={role.id} value={role.id}>
+                        {role.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={roleSkillForm.skillId}
+                    onChange={(event) =>
+                      setRoleSkillForm((current) => ({ ...current, skillId: event.target.value }))
+                    }
+                  >
+                    <option value="">Select skill</option>
+                    {dashboard.skills.map((skill) => (
+                      <option key={skill.id} value={skill.id}>
+                        {skill.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="ghost-button"
+                    disabled={!roleSkillForm.roleId || !roleSkillForm.skillId || submitting !== null}
+                    onClick={() => void bindSkillToRole()}
+                  >
+                    {submitting === 'bind-skill' ? 'Attaching…' : 'Attach skill to role'}
+                  </button>
+                </div>
+
+                <div className="card-grid">
+                  {dashboard.skills.map((skill) => (
+                    <article key={skill.id} className="mini-card">
+                      <strong>{skill.name}</strong>
+                      <span className="status-chip neutral">{prettyStatus(skill.source)}</span>
+                      <p>{skill.instructions}</p>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {(view === 'overview' || view === 'goals') && (
+              <section className="panel">
+                <div className="panel-header">
+                  <div>
+                    <p className="eyebrow">Goals</p>
+                    <h3>Create app goals and compile them into workflows</h3>
+                  </div>
+                  <span className="status-chip neutral">{dashboard.goals.length} goals</span>
+                </div>
+
+                <div className="form-grid">
+                  <select
+                    value={goalForm.projectId}
+                    onChange={(event) =>
+                      setGoalForm((current) => ({ ...current, projectId: event.target.value }))
+                    }
+                  >
+                    <option value="">Select project</option>
+                    {dashboard.projects.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={goalForm.kind}
+                    onChange={(event) =>
+                      setGoalForm((current) => ({
+                        ...current,
+                        kind: event.target.value as GoalSpec['kind'],
+                      }))
+                    }
+                  >
+                    <option value="create_app">Create app</option>
+                    <option value="create_workflow">Create workflow</option>
+                  </select>
+                  <input
+                    value={goalForm.title}
+                    onChange={(event) =>
+                      setGoalForm((current) => ({ ...current, title: event.target.value }))
+                    }
+                    placeholder="Goal title"
+                  />
+                </div>
+                <textarea
+                  value={goalForm.prompt}
+                  onChange={(event) =>
+                    setGoalForm((current) => ({ ...current, prompt: event.target.value }))
+                  }
+                  placeholder="Describe what the super owner should produce"
+                />
+                <button
+                  className="primary-button"
+                  disabled={!goalForm.projectId || !goalForm.title || !goalForm.prompt || submitting !== null}
+                  onClick={() => void createGoal()}
+                >
+                  {submitting === 'create-goal' ? 'Creating…' : 'Create goal'}
+                </button>
+
+                <div className="table-list">
+                  {dashboard.goals.map((goal) => (
+                    <article key={goal.id} className="list-row stacked">
+                      <div>
+                        <strong>{goal.title}</strong>
+                        <p>{goal.prompt}</p>
+                      </div>
+                      <div className="row-tags">
+                        <span className="status-chip neutral">{prettyStatus(goal.kind)}</span>
+                        <span className={`status-chip ${goal.status}`}>{prettyStatus(goal.status)}</span>
+                      </div>
+                      <button
+                        className="ghost-button"
+                        disabled={submitting !== null}
+                        onClick={() => void compileGoal(goal.id)}
+                      >
+                        {submitting === `compile-goal-${goal.id}` ? 'Compiling…' : 'Compile goal'}
+                      </button>
+                    </article>
+                  ))}
+                </div>
+
+                {compiledGoal && (
+                  <article className="mini-card">
+                    <strong>Latest compiled workflow: {compiledGoal.workflow.name}</strong>
+                    <p>{compiledGoal.workflow.description}</p>
+                    <p>{compiledGoal.workflow.steps.length} generated steps</p>
+                  </article>
+                )}
               </section>
             )}
 
@@ -804,6 +1349,19 @@ function App() {
                     <option value="codex">Codex CLI</option>
                     <option value="opencode">OpenCode</option>
                     <option value="shell">Shell</option>
+                  </select>
+                  <select
+                    value={workflowForm.roleId}
+                    onChange={(event) =>
+                      setWorkflowForm((current) => ({ ...current, roleId: event.target.value }))
+                    }
+                  >
+                    <option value="">Select role</option>
+                    {dashboard.roles.map((role) => (
+                      <option key={role.id} value={role.id}>
+                        {role.name}
+                      </option>
+                    ))}
                   </select>
                 </div>
                 <textarea
@@ -862,6 +1420,11 @@ function App() {
                         <span className="status-chip neutral">
                           {workflow.steps.length} step{workflow.steps.length === 1 ? '' : 's'}
                         </span>
+                        {workflow.steps[0]?.role_id ? (
+                          <span className="status-chip neutral">
+                            {roleIndex[workflow.steps[0].role_id]?.name || 'Role assigned'}
+                          </span>
+                        ) : null}
                       </div>
                     </article>
                   ))}
@@ -1054,6 +1617,11 @@ function App() {
                             <span className="status-chip neutral">
                               {prettyStatus(workflowStep?.executor_kind || 'shell')}
                             </span>
+                            {workflowStep?.role_id ? (
+                              <span className="status-chip neutral">
+                                {roleIndex[workflowStep.role_id]?.name || 'Assigned role'}
+                              </span>
+                            ) : null}
                             {workflowStep?.requires_approval ? (
                               <span className="status-chip warning">approval gate</span>
                             ) : null}

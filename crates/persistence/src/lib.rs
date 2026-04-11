@@ -7,14 +7,17 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use domain::{
-    ApprovalDecision, ApprovalGate, Artifact, EventEnvelope, EventScope, ExecutorKind,
-    ExecutorProfile, NewExecutorProfile, NewProject, NewRun, NewWorkflowTemplate, PairingSession,
-    Project, Run, RunStatus, RunStep, RunStepStatus, WorkflowStep, WorkflowTemplate,
+    AgentRole, ApprovalDecision, ApprovalGate, Artifact, EventEnvelope, EventScope, ExecutorKind,
+    ExecutorProfile, GoalKind, GoalSpec, GoalStatus, NewAgentRole, NewExecutorProfile, NewGoalSpec,
+    NewOrganizationTemplate, NewProject, NewRun, NewSkillDefinition, NewWorkflowTemplate,
+    OrganizationTemplate, PairingSession, Project, Run, RunStatus, RunStep, RunStepStatus,
+    SkillBinding, SkillDefinition, SkillSource, WorkflowStep, WorkflowTemplate,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/0001_initial.sql");
+const SUPER_OWNER_MIGRATION: &str = include_str!("../migrations/0002_super_owner.sql");
 
 #[derive(Clone)]
 pub struct OrchestratorStore {
@@ -53,6 +56,20 @@ impl OrchestratorStore {
     pub fn run_migrations(&self) -> Result<()> {
         let connection = self.connection()?;
         connection.execute_batch(INITIAL_MIGRATION)?;
+        for statement in SUPER_OWNER_MIGRATION
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+        {
+            if let Err(error) = connection.execute(statement, []) {
+                let message = error.to_string();
+                let ignorable = message.contains("duplicate column name")
+                    || message.contains("already exists");
+                if !ignorable {
+                    return Err(error.into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -64,6 +81,8 @@ impl OrchestratorStore {
             workspace_path: input.workspace_path,
             repository_url: input.repository_url,
             default_executor_profile_id: input.default_executor_profile_id,
+            agents_md_path: None,
+            agents_md_updated_at: None,
             archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -72,8 +91,8 @@ impl OrchestratorStore {
         let connection = self.connection()?;
         connection.execute(
             "INSERT INTO projects
-            (id, name, description, workspace_path, repository_url, default_executor_profile_id, archived_at, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (id, name, description, workspace_path, repository_url, default_executor_profile_id, agents_md_path, agents_md_updated_at, archived_at, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 project.id.to_string(),
                 &project.name,
@@ -81,6 +100,8 @@ impl OrchestratorStore {
                 &project.workspace_path,
                 project.repository_url.as_deref(),
                 project.default_executor_profile_id.map(|value| value.to_string()),
+                project.agents_md_path.as_deref(),
+                project.agents_md_updated_at.map(to_timestamp),
                 project.archived_at.map(to_timestamp),
                 to_timestamp(project.created_at),
                 to_timestamp(project.updated_at),
@@ -93,7 +114,7 @@ impl OrchestratorStore {
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, name, description, workspace_path, repository_url, default_executor_profile_id, archived_at, created_at, updated_at
+            "SELECT id, name, description, workspace_path, repository_url, default_executor_profile_id, agents_md_path, agents_md_updated_at, archived_at, created_at, updated_at
              FROM projects
              ORDER BY created_at DESC",
         )?;
@@ -106,13 +127,69 @@ impl OrchestratorStore {
                 workspace_path: row.get(3)?,
                 repository_url: row.get(4)?,
                 default_executor_profile_id: parse_optional_uuid(row.get::<_, Option<String>>(5)?)?,
-                archived_at: parse_optional_datetime(row.get::<_, Option<String>>(6)?)?,
-                created_at: parse_datetime(&row.get::<_, String>(7)?)?,
-                updated_at: parse_datetime(&row.get::<_, String>(8)?)?,
+                agents_md_path: row.get(6)?,
+                agents_md_updated_at: parse_optional_datetime(row.get::<_, Option<String>>(7)?)?,
+                archived_at: parse_optional_datetime(row.get::<_, Option<String>>(8)?)?,
+                created_at: parse_datetime(&row.get::<_, String>(9)?)?,
+                updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
             })
         })?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_project(&self, project_id: Uuid) -> Result<Option<Project>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, workspace_path, repository_url, default_executor_profile_id, agents_md_path, agents_md_updated_at, archived_at, created_at, updated_at
+             FROM projects
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([project_id.to_string()], |row| {
+                Ok(Project {
+                    id: parse_uuid(row.get::<_, String>(0)?)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    workspace_path: row.get(3)?,
+                    repository_url: row.get(4)?,
+                    default_executor_profile_id: parse_optional_uuid(row.get::<_, Option<String>>(5)?)?,
+                    agents_md_path: row.get(6)?,
+                    agents_md_updated_at: parse_optional_datetime(row.get::<_, Option<String>>(7)?)?,
+                    archived_at: parse_optional_datetime(row.get::<_, Option<String>>(8)?)?,
+                    created_at: parse_datetime(&row.get::<_, String>(9)?)?,
+                    updated_at: parse_datetime(&row.get::<_, String>(10)?)?,
+                })
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_executor_profile(&self, profile_id: Uuid) -> Result<Option<ExecutorProfile>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, kind, binary_path, config_json, created_at, updated_at
+             FROM executor_profiles
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([profile_id.to_string()], |row| {
+                let config_json: String = row.get(4)?;
+                Ok(ExecutorProfile {
+                    id: parse_uuid(row.get::<_, String>(0)?)?,
+                    name: row.get(1)?,
+                    kind: ExecutorKind::from_str(&row.get::<_, String>(2)?)
+                        .map_err(to_sql_conversion_error)?,
+                    binary_path: row.get(3)?,
+                    config_json: serde_json::from_str(&config_json).map_err(to_sql_conversion_error)?,
+                    created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+                    updated_at: parse_datetime(&row.get::<_, String>(6)?)?,
+                })
+            })
+            .optional()
             .map_err(Into::into)
     }
 
@@ -172,6 +249,313 @@ impl OrchestratorStore {
             .map_err(Into::into)
     }
 
+    pub fn update_project_agents_md(
+        &self,
+        project_id: Uuid,
+        agents_md_path: Option<String>,
+        agents_md_updated_at: Option<DateTime<Utc>>,
+    ) -> Result<Project> {
+        let updated_at = Utc::now();
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "UPDATE projects
+                 SET agents_md_path = ?2, agents_md_updated_at = ?3, updated_at = ?4
+                 WHERE id = ?1",
+                params![
+                    project_id.to_string(),
+                    agents_md_path.as_deref(),
+                    agents_md_updated_at.map(to_timestamp),
+                    to_timestamp(updated_at),
+                ],
+            )?;
+        }
+
+        self.get_project(project_id)?
+            .ok_or_else(|| anyhow!("project {project_id} not found after update"))
+    }
+
+    pub fn create_agent_role(&self, input: NewAgentRole) -> Result<AgentRole> {
+        let role = AgentRole {
+            id: Uuid::new_v4(),
+            name: input.name,
+            description: input.description,
+            system_prompt: input.system_prompt,
+            default_executor_kind: input.default_executor_kind,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO agent_roles
+             (id, name, description, system_prompt, default_executor_kind, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                role.id.to_string(),
+                &role.name,
+                role.description.as_deref(),
+                &role.system_prompt,
+                role.default_executor_kind.as_ref().map(ExecutorKind::as_str),
+                to_timestamp(role.created_at),
+                to_timestamp(role.updated_at),
+            ],
+        )?;
+
+        Ok(role)
+    }
+
+    pub fn list_agent_roles(&self) -> Result<Vec<AgentRole>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, system_prompt, default_executor_kind, created_at, updated_at
+             FROM agent_roles
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = statement.query_map([], map_agent_role)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_agent_role(&self, role_id: Uuid) -> Result<Option<AgentRole>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, system_prompt, default_executor_kind, created_at, updated_at
+             FROM agent_roles
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([role_id.to_string()], map_agent_role)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn create_skill(&self, input: NewSkillDefinition) -> Result<SkillDefinition> {
+        let skill = SkillDefinition {
+            id: Uuid::new_v4(),
+            name: input.name,
+            description: input.description,
+            instructions: input.instructions,
+            source: input.source,
+            source_uri: input.source_uri,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO skills
+             (id, name, description, instructions, source, source_uri, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                skill.id.to_string(),
+                &skill.name,
+                skill.description.as_deref(),
+                &skill.instructions,
+                skill.source.as_str(),
+                skill.source_uri.as_deref(),
+                to_timestamp(skill.created_at),
+                to_timestamp(skill.updated_at),
+            ],
+        )?;
+
+        Ok(skill)
+    }
+
+    pub fn list_skills(&self) -> Result<Vec<SkillDefinition>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, instructions, source, source_uri, created_at, updated_at
+             FROM skills
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = statement.query_map([], map_skill)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn bind_skill_to_role(&self, role_id: Uuid, skill_id: Uuid) -> Result<SkillBinding> {
+        let binding = SkillBinding {
+            role_id,
+            skill_id,
+            created_at: Utc::now(),
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO role_skills (role_id, skill_id, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![
+                binding.role_id.to_string(),
+                binding.skill_id.to_string(),
+                to_timestamp(binding.created_at),
+            ],
+        )?;
+
+        Ok(binding)
+    }
+
+    pub fn list_role_skills(&self, role_id: Uuid) -> Result<Vec<SkillBinding>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT role_id, skill_id, created_at
+             FROM role_skills
+             WHERE role_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+
+        let rows = statement.query_map([role_id.to_string()], |row| {
+            Ok(SkillBinding {
+                role_id: parse_uuid(row.get::<_, String>(0)?)?,
+                skill_id: parse_uuid(row.get::<_, String>(1)?)?,
+                created_at: parse_datetime(&row.get::<_, String>(2)?)?,
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn create_goal(&self, input: NewGoalSpec) -> Result<GoalSpec> {
+        let goal = GoalSpec {
+            id: Uuid::new_v4(),
+            project_id: input.project_id,
+            kind: input.kind,
+            title: input.title,
+            prompt: input.prompt,
+            status: GoalStatus::Draft,
+            compiled_workflow_template_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO goals
+             (id, project_id, kind, title, prompt, status, compiled_workflow_template_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                goal.id.to_string(),
+                goal.project_id.to_string(),
+                goal.kind.as_str(),
+                &goal.title,
+                &goal.prompt,
+                goal.status.as_str(),
+                goal.compiled_workflow_template_id.map(|value| value.to_string()),
+                to_timestamp(goal.created_at),
+                to_timestamp(goal.updated_at),
+            ],
+        )?;
+
+        Ok(goal)
+    }
+
+    pub fn list_goals(&self) -> Result<Vec<GoalSpec>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, kind, title, prompt, status, compiled_workflow_template_id, created_at, updated_at
+             FROM goals
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = statement.query_map([], map_goal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_goal(&self, goal_id: Uuid) -> Result<Option<GoalSpec>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, kind, title, prompt, status, compiled_workflow_template_id, created_at, updated_at
+             FROM goals
+             WHERE id = ?1",
+        )?;
+
+        statement
+            .query_row([goal_id.to_string()], map_goal)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn update_goal_compilation(
+        &self,
+        goal_id: Uuid,
+        workflow_template_id: Uuid,
+        status: GoalStatus,
+    ) -> Result<GoalSpec> {
+        let updated_at = Utc::now();
+        {
+            let connection = self.connection()?;
+            connection.execute(
+                "UPDATE goals
+                 SET compiled_workflow_template_id = ?2, status = ?3, updated_at = ?4
+                 WHERE id = ?1",
+                params![
+                    goal_id.to_string(),
+                    workflow_template_id.to_string(),
+                    status.as_str(),
+                    to_timestamp(updated_at),
+                ],
+            )?;
+        }
+
+        self.get_goal(goal_id)?
+            .ok_or_else(|| anyhow!("goal {goal_id} not found after update"))
+    }
+
+    pub fn create_organization_template(
+        &self,
+        input: NewOrganizationTemplate,
+    ) -> Result<OrganizationTemplate> {
+        let organization = OrganizationTemplate {
+            id: Uuid::new_v4(),
+            name: input.name,
+            description: input.description,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO organization_templates (id, name, description, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                organization.id.to_string(),
+                &organization.name,
+                organization.description.as_deref(),
+                to_timestamp(organization.created_at),
+                to_timestamp(organization.updated_at),
+            ],
+        )?;
+
+        Ok(organization)
+    }
+
+    pub fn list_organization_templates(&self) -> Result<Vec<OrganizationTemplate>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, created_at, updated_at
+             FROM organization_templates
+             ORDER BY created_at DESC",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok(OrganizationTemplate {
+                id: parse_uuid(row.get::<_, String>(0)?)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                created_at: parse_datetime(&row.get::<_, String>(3)?)?,
+                updated_at: parse_datetime(&row.get::<_, String>(4)?)?,
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn create_workflow(&self, input: NewWorkflowTemplate) -> Result<WorkflowTemplate> {
         let workflow = WorkflowTemplate {
             id: Uuid::new_v4(),
@@ -190,10 +574,15 @@ impl OrchestratorStore {
                     instruction: step.instruction,
                     order_index: step.order_index,
                     executor_kind: step.executor_kind,
+                    role_id: step.role_id,
                     depends_on_step_id: step.depends_on_step_id,
                     timeout_seconds: step.timeout_seconds,
                     retry_limit: step.retry_limit,
                     requires_approval: step.requires_approval,
+                    success_criteria: step.success_criteria,
+                    artifact_contract: step.artifact_contract,
+                    input_schema: step.input_schema,
+                    output_schema: step.output_schema,
                 })
                 .collect(),
         };
@@ -217,8 +606,8 @@ impl OrchestratorStore {
         for step in &workflow.steps {
             transaction.execute(
                 "INSERT INTO workflow_steps
-                (id, workflow_template_id, name, instruction, order_index, executor_kind, depends_on_step_id, timeout_seconds, retry_limit, requires_approval)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (id, workflow_template_id, name, instruction, order_index, executor_kind, role_id, depends_on_step_id, timeout_seconds, retry_limit, requires_approval, success_criteria, artifact_contract, input_schema_json, output_schema_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     step.id.to_string(),
                     workflow.id.to_string(),
@@ -226,10 +615,15 @@ impl OrchestratorStore {
                     &step.instruction,
                     step.order_index,
                     step.executor_kind.as_str(),
+                    step.role_id.map(|value| value.to_string()),
                     step.depends_on_step_id.map(|value| value.to_string()),
                     step.timeout_seconds,
                     step.retry_limit,
                     step.requires_approval as i64,
+                    step.success_criteria.as_deref(),
+                    step.artifact_contract.as_deref(),
+                    serde_json::to_string(&step.input_schema)?,
+                    serde_json::to_string(&step.output_schema)?,
                 ],
             )?;
         }
@@ -285,6 +679,10 @@ impl OrchestratorStore {
             project_id: input.project_id,
             workflow_template_id: input.workflow_template_id,
             executor_profile_id: input.executor_profile_id,
+            goal_id: input.goal_id,
+            compiled_by: input.compiled_by,
+            assigned_role_id: input.assigned_role_id,
+            effective_executor_kind: input.effective_executor_kind,
             status: RunStatus::Queued,
             requested_by: input.requested_by,
             created_at: Utc::now(),
@@ -296,13 +694,17 @@ impl OrchestratorStore {
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO runs
-            (id, project_id, workflow_template_id, executor_profile_id, status, requested_by, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (id, project_id, workflow_template_id, executor_profile_id, goal_id, compiled_by, assigned_role_id, effective_executor_kind, status, requested_by, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 run.id.to_string(),
                 run.project_id.to_string(),
                 run.workflow_template_id.to_string(),
                 run.executor_profile_id.map(|value| value.to_string()),
+                run.goal_id.map(|value| value.to_string()),
+                run.compiled_by.as_deref(),
+                run.assigned_role_id.map(|value| value.to_string()),
+                run.effective_executor_kind.as_ref().map(ExecutorKind::as_str),
                 run.status.as_str(),
                 run.requested_by.as_deref(),
                 to_timestamp(run.created_at),
@@ -345,7 +747,7 @@ impl OrchestratorStore {
     pub fn list_runs(&self) -> Result<Vec<Run>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, workflow_template_id, executor_profile_id, status, requested_by, created_at, updated_at
+            "SELECT id, project_id, workflow_template_id, executor_profile_id, goal_id, compiled_by, assigned_role_id, effective_executor_kind, status, requested_by, created_at, updated_at
              FROM runs
              ORDER BY created_at DESC",
         )?;
@@ -356,11 +758,18 @@ impl OrchestratorStore {
                 project_id: parse_uuid(row.get::<_, String>(1)?)?,
                 workflow_template_id: parse_uuid(row.get::<_, String>(2)?)?,
                 executor_profile_id: parse_optional_uuid(row.get::<_, Option<String>>(3)?)?,
-                status: RunStatus::from_str(&row.get::<_, String>(4)?)
+                goal_id: parse_optional_uuid(row.get::<_, Option<String>>(4)?)?,
+                compiled_by: row.get(5)?,
+                assigned_role_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
+                effective_executor_kind: row
+                    .get::<_, Option<String>>(7)?
+                    .map(|value| ExecutorKind::from_str(&value).map_err(to_sql_conversion_error))
+                    .transpose()?,
+                status: RunStatus::from_str(&row.get::<_, String>(8)?)
                     .map_err(to_sql_conversion_error)?,
-                requested_by: row.get(5)?,
-                created_at: parse_datetime(&row.get::<_, String>(6)?)?,
-                updated_at: parse_datetime(&row.get::<_, String>(7)?)?,
+                requested_by: row.get(9)?,
+                created_at: parse_datetime(&row.get::<_, String>(10)?)?,
+                updated_at: parse_datetime(&row.get::<_, String>(11)?)?,
             })
         })?;
 
@@ -371,7 +780,7 @@ impl OrchestratorStore {
     pub fn get_run(&self, run_id: Uuid) -> Result<Option<Run>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, project_id, workflow_template_id, executor_profile_id, status, requested_by, created_at, updated_at
+            "SELECT id, project_id, workflow_template_id, executor_profile_id, goal_id, compiled_by, assigned_role_id, effective_executor_kind, status, requested_by, created_at, updated_at
              FROM runs
              WHERE id = ?1",
         )?;
@@ -455,7 +864,7 @@ impl OrchestratorStore {
     pub fn get_workflow_step(&self, workflow_step_id: Uuid) -> Result<Option<WorkflowStep>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, workflow_template_id, name, instruction, order_index, executor_kind, depends_on_step_id, timeout_seconds, retry_limit, requires_approval
+            "SELECT id, workflow_template_id, name, instruction, order_index, executor_kind, role_id, depends_on_step_id, timeout_seconds, retry_limit, requires_approval, success_criteria, artifact_contract, input_schema_json, output_schema_json
              FROM workflow_steps
              WHERE id = ?1",
         )?;
@@ -787,7 +1196,7 @@ impl OrchestratorStore {
     pub fn list_workflow_steps(&self, workflow_template_id: Uuid) -> Result<Vec<WorkflowStep>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, workflow_template_id, name, instruction, order_index, executor_kind, depends_on_step_id, timeout_seconds, retry_limit, requires_approval
+            "SELECT id, workflow_template_id, name, instruction, order_index, executor_kind, role_id, depends_on_step_id, timeout_seconds, retry_limit, requires_approval, success_criteria, artifact_contract, input_schema_json, output_schema_json
              FROM workflow_steps
              WHERE workflow_template_id = ?1
              ORDER BY order_index ASC",
@@ -797,6 +1206,25 @@ impl OrchestratorStore {
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn update_run_step_external_session(
+        &self,
+        step_id: Uuid,
+        session_id: Option<String>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE run_steps SET external_session_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![session_id, step_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(sql, params)?;
+        Ok(())
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
@@ -816,10 +1244,59 @@ fn map_run(row: &Row<'_>) -> rusqlite::Result<Run> {
         project_id: parse_uuid(row.get::<_, String>(1)?)?,
         workflow_template_id: parse_uuid(row.get::<_, String>(2)?)?,
         executor_profile_id: parse_optional_uuid(row.get::<_, Option<String>>(3)?)?,
-        status: RunStatus::from_str(&row.get::<_, String>(4)?).map_err(to_sql_conversion_error)?,
-        requested_by: row.get(5)?,
+        goal_id: parse_optional_uuid(row.get::<_, Option<String>>(4)?)?,
+        compiled_by: row.get(5)?,
+        assigned_role_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
+        effective_executor_kind: row
+            .get::<_, Option<String>>(7)?
+            .map(|value| ExecutorKind::from_str(&value).map_err(to_sql_conversion_error))
+            .transpose()?,
+        status: RunStatus::from_str(&row.get::<_, String>(8)?).map_err(to_sql_conversion_error)?,
+        requested_by: row.get(9)?,
+        created_at: parse_datetime(&row.get::<_, String>(10)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(11)?)?,
+    })
+}
+
+fn map_agent_role(row: &Row<'_>) -> rusqlite::Result<AgentRole> {
+    Ok(AgentRole {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        system_prompt: row.get(3)?,
+        default_executor_kind: row
+            .get::<_, Option<String>>(4)?
+            .map(|value| ExecutorKind::from_str(&value).map_err(to_sql_conversion_error))
+            .transpose()?,
+        created_at: parse_datetime(&row.get::<_, String>(5)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(6)?)?,
+    })
+}
+
+fn map_skill(row: &Row<'_>) -> rusqlite::Result<SkillDefinition> {
+    Ok(SkillDefinition {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        instructions: row.get(3)?,
+        source: SkillSource::from_str(&row.get::<_, String>(4)?).map_err(to_sql_conversion_error)?,
+        source_uri: row.get(5)?,
         created_at: parse_datetime(&row.get::<_, String>(6)?)?,
         updated_at: parse_datetime(&row.get::<_, String>(7)?)?,
+    })
+}
+
+fn map_goal(row: &Row<'_>) -> rusqlite::Result<GoalSpec> {
+    Ok(GoalSpec {
+        id: parse_uuid(row.get::<_, String>(0)?)?,
+        project_id: parse_uuid(row.get::<_, String>(1)?)?,
+        kind: GoalKind::from_str(&row.get::<_, String>(2)?).map_err(to_sql_conversion_error)?,
+        title: row.get(3)?,
+        prompt: row.get(4)?,
+        status: GoalStatus::from_str(&row.get::<_, String>(5)?).map_err(to_sql_conversion_error)?,
+        compiled_workflow_template_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
+        created_at: parse_datetime(&row.get::<_, String>(7)?)?,
+        updated_at: parse_datetime(&row.get::<_, String>(8)?)?,
     })
 }
 
@@ -837,6 +1314,8 @@ fn map_run_step(row: &Row<'_>) -> rusqlite::Result<RunStep> {
 }
 
 fn map_workflow_step(row: &Row<'_>) -> rusqlite::Result<WorkflowStep> {
+    let input_schema_json: String = row.get(13)?;
+    let output_schema_json: String = row.get(14)?;
     Ok(WorkflowStep {
         id: parse_uuid(row.get::<_, String>(0)?)?,
         workflow_template_id: parse_uuid(row.get::<_, String>(1)?)?,
@@ -845,10 +1324,15 @@ fn map_workflow_step(row: &Row<'_>) -> rusqlite::Result<WorkflowStep> {
         order_index: row.get(4)?,
         executor_kind: ExecutorKind::from_str(&row.get::<_, String>(5)?)
             .map_err(to_sql_conversion_error)?,
-        depends_on_step_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
-        timeout_seconds: row.get(7)?,
-        retry_limit: row.get(8)?,
-        requires_approval: row.get::<_, i64>(9)? == 1,
+        role_id: parse_optional_uuid(row.get::<_, Option<String>>(6)?)?,
+        depends_on_step_id: parse_optional_uuid(row.get::<_, Option<String>>(7)?)?,
+        timeout_seconds: row.get(8)?,
+        retry_limit: row.get(9)?,
+        requires_approval: row.get::<_, i64>(10)? == 1,
+        success_criteria: row.get(11)?,
+        artifact_contract: row.get(12)?,
+        input_schema: serde_json::from_str(&input_schema_json).map_err(to_sql_conversion_error)?,
+        output_schema: serde_json::from_str(&output_schema_json).map_err(to_sql_conversion_error)?,
     })
 }
 
@@ -971,10 +1455,15 @@ mod tests {
                     instruction: "Inspect the repo and draft a plan".into(),
                     order_index: 0,
                     executor_kind: ExecutorKind::NativeCliAi,
+                    role_id: None,
                     depends_on_step_id: None,
                     timeout_seconds: Some(120),
                     retry_limit: 1,
                     requires_approval: true,
+                    success_criteria: None,
+                    artifact_contract: None,
+                    input_schema: serde_json::json!({}),
+                    output_schema: serde_json::json!({}),
                 }],
             })
             .expect("workflow");
@@ -984,6 +1473,10 @@ mod tests {
                 project_id: project.id,
                 workflow_template_id: workflow.id,
                 executor_profile_id: Some(executor.id),
+                goal_id: None,
+                compiled_by: None,
+                assigned_role_id: None,
+                effective_executor_kind: None,
                 requested_by: Some("operator".into()),
             })
             .expect("run");
@@ -1058,10 +1551,15 @@ mod tests {
                     instruction: "Do the work".into(),
                     order_index: 0,
                     executor_kind: ExecutorKind::Shell,
+                    role_id: None,
                     depends_on_step_id: None,
                     timeout_seconds: None,
                     retry_limit: 0,
                     requires_approval: false,
+                    success_criteria: None,
+                    artifact_contract: None,
+                    input_schema: serde_json::json!({}),
+                    output_schema: serde_json::json!({}),
                 }],
             })
             .expect("workflow");
@@ -1070,6 +1568,10 @@ mod tests {
                 project_id: project.id,
                 workflow_template_id: workflow.id,
                 executor_profile_id: None,
+                goal_id: None,
+                compiled_by: None,
+                assigned_role_id: None,
+                effective_executor_kind: None,
                 requested_by: None,
             })
             .expect("run");

@@ -396,11 +396,13 @@ dependencies = [
  "axum",
  "chrono",
  "domain",
+ "executors",
  "futures-util",
  "http",
  "observability",
  "orchestrator",
  "persistence",
+ "runtime",
  "serde",
  "serde_json",
  "tokio",
@@ -659,7 +661,9 @@ dependencies = [
  "anyhow",
  "axum",
  "control-server",
+ "executors",
  "observability",
+ "orchestrator",
  "persistence",
  "security",
  "serde",
@@ -2251,11 +2255,17 @@ name = "orchestrator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "domain",
+ "executors",
  "observability",
+ "parking_lot",
  "persistence",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2842,6 +2852,14 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "domain",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "rusqlite"

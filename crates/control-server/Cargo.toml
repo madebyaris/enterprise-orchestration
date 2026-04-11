@@ -9,11 +9,13 @@ anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
 domain = { path = "../domain" }
+executors = { path = "../executors" }
 futures-util.workspace = true
 http.workspace = true
 observability = { path = "../observability" }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
+runtime = { path = "../runtime" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

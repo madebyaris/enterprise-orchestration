@@ -8,7 +8,9 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 control-server = { path = "../control-server" }
+executors = { path = "../executors" }
 observability = { path = "../observability" }
+orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
 security = { path = "../security" }
 serde.workspace = true

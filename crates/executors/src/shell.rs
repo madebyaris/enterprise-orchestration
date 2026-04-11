@@ -40,10 +40,14 @@ impl ExecutorAdapter for ShellExecutorAdapter {
             json!({"command": request.prompt}),
         ));
 
-        let mut command = Command::new("sh");
+        let binary = request.binary_path.as_deref().unwrap_or("sh");
+        let mut command = Command::new(binary);
         command.args(["-lc", request.prompt.as_str()]);
         if let Some(workspace_path) = &request.workspace_path {
             command.current_dir(workspace_path);
+        }
+        for (key, value) in &request.orchestration_env {
+            command.env(key, value);
         }
 
         let output = command.output()?;
@@ -76,11 +80,15 @@ impl ExecutorAdapter for ShellExecutorAdapter {
     }
 
     fn spawn_session(&self, request: &ExecutorRunRequest) -> Result<ExecutorSession> {
-        let mut command = Command::new("sh");
+        let binary = request.binary_path.as_deref().unwrap_or("sh");
+        let mut command = Command::new(binary);
         command.args(["-lc", request.prompt.as_str()]);
         command.stdout(Stdio::null()).stderr(Stdio::null());
         if let Some(workspace_path) = &request.workspace_path {
             command.current_dir(workspace_path);
+        }
+        for (key, value) in &request.orchestration_env {
+            command.env(key, value);
         }
 
         let child = command.spawn()?;
@@ -119,6 +127,8 @@ mod tests {
                     prompt: "printf hello".into(),
                     workspace_path: None,
                     permission_mode: None,
+                    binary_path: None,
+                    config_json: serde_json::json!({}),
                     orchestration_env: Vec::new(),
                 },
                 &mut |event| events.push(event),

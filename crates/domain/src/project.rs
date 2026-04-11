@@ -10,6 +10,8 @@ pub struct Project {
     pub workspace_path: String,
     pub repository_url: Option<String>,
     pub default_executor_profile_id: Option<Uuid>,
+    pub agents_md_path: Option<String>,
+    pub agents_md_updated_at: Option<DateTime<Utc>>,
     pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

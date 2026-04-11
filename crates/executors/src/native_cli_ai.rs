@@ -182,7 +182,8 @@ impl ExecutorAdapter for NativeCliAiAdapter {
 
 impl NativeCliAiAdapter {
     fn base_command(&self, request: &ExecutorRunRequest) -> Command {
-        let mut command = Command::new(&self.binary);
+        let binary = request.binary_path.as_deref().unwrap_or(&self.binary);
+        let mut command = Command::new(binary);
         if let Some(workspace_path) = &request.workspace_path {
             command.current_dir(workspace_path);
         }

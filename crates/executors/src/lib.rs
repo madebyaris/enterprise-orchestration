@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod claude_code;
 pub mod codex;
+mod generic_cli;
 pub mod native_cli_ai;
 pub mod opencode;
 pub mod shell;

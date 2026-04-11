@@ -1,15 +1,23 @@
+pub mod agent_role;
 pub mod approval;
 pub mod artifact;
 pub mod event;
 pub mod executor;
+pub mod goal;
+pub mod organization;
 pub mod project;
 pub mod run;
+pub mod skill;
 pub mod workflow;
 
+pub use agent_role::{AgentRole, NewAgentRole};
 pub use approval::{ApprovalDecision, ApprovalGate};
 pub use artifact::{Artifact, PairingSession};
 pub use event::{EventEnvelope, EventScope};
 pub use executor::{ExecutorKind, ExecutorProfile, NewExecutorProfile};
+pub use goal::{GoalKind, GoalSpec, GoalStatus, NewGoalSpec};
+pub use organization::{NewOrganizationTemplate, OrganizationTemplate};
 pub use project::{NewProject, Project};
 pub use run::{NewRun, Run, RunStatus, RunStep, RunStepStatus};
+pub use skill::{NewSkillDefinition, SkillBinding, SkillDefinition, SkillSource};
 pub use workflow::{NewWorkflowStep, NewWorkflowTemplate, WorkflowStep, WorkflowTemplate};
